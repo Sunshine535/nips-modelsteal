@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ML artifacts
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+wandb/
+mlruns/
+lightning_logs/
+tensorboard_logs/
+
+# Results (track selectively)
+results/
+outputs/
+checkpoints/
+logs/
+
+# HuggingFace cache
+.cache/
+models/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+data/
+*.csv
+*.jsonl
+*.parquet
+!configs/*.yaml
