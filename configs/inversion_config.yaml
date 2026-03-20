@@ -1,14 +1,20 @@
 # Progressive Parameter Inversion — Configuration
 
 # === Model Paths ===
+# Teacher and student MUST share the same architecture (hidden_size, num_layers, num_heads, etc.).
+# Layer-wise weight recovery compares/optimizes per-tensor shapes that only align when architectures match;
+# e.g. 9B vs 0.8B is invalid for parameter recovery (no weight correspondence).
+# Here both use Qwen3.5-4B to stay within a practical memory budget vs dual 9B. In the full paper
+# experiment, treat the student as a second instance of the same architecture initialized from random
+# weights or a different checkpoint—not a smaller Qwen variant.
 teacher:
-  model_name: "Qwen/Qwen3.5-9B"
+  model_name: "Qwen/Qwen3.5-4B"
   device: "cuda"
   dtype: "bfloat16"
   max_seq_len: 2048
 
 student:
-  model_name: "Qwen/Qwen3.5-0.8B"
+  model_name: "Qwen/Qwen3.5-4B"
   device: "cuda"
   dtype: "bfloat16"
   max_seq_len: 2048

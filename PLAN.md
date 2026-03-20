@@ -6,12 +6,22 @@
 
 ---
 
+## Architecture requirement (teacher / student)
+
+Progressive layer-wise **parameter** inversion assumes the student can hold tensors in one-to-one correspondence with the teacher (same `hidden_size`, depth, head layout, and block structure). A smaller variant of the “same family” (e.g. Qwen3.5-9B teacher with Qwen3.5-0.8B student) does **not** satisfy this: shapes differ, so “recover teacher weights” is ill-posed.
+
+**Plan:** Run the core pipeline with **same architecture** for both roles—e.g. both `Qwen3.5-4B` in `configs/inversion_config.yaml`—and distinguish the student by **initialization** (random init, or a different pretrained checkpoint), not by model size. Larger-scale runs (e.g. dual 9B) are optional if memory allows; cross–model-family studies belong in a separate ablation, not the default weight-recovery config.
+
+This aligns with the proposal’s risk note that architecture mismatch requires dedicated ablation rather than the main recovery setting (see `PROPOSAL.md`).
+
+---
+
 ## Week 1: Infrastructure & Baselines (May 19–25)
 
 ### Tasks
-- [ ] Set up environment, verify Qwen3.5-{0.8B, 2B, 4B, 9B} load on 8x A100
+- [ ] Set up environment, verify Qwen3.5-4B (and optional other sizes for non–weight-recovery baselines) on 8x A100
 - [ ] Implement black-box teacher wrapper (local model, API-style interface returning logits only)
-- [ ] Run baseline knowledge distillation: 0.8B student ← 9B teacher, 100K queries
+- [ ] Run baseline knowledge distillation: same-architecture student ← teacher (e.g. 4B ← 4B per `configs/inversion_config.yaml`), 100K queries
 - [ ] Implement evaluation harness: weight cosine similarity, output match rate, KL divergence
 
 ### GPU Budget: ~50 GPU-hours
@@ -70,11 +80,11 @@
 ## Week 5: Scaling Experiments (Jun 16–22)
 
 ### Tasks
-- [ ] Run full inversion pipeline for 3 student sizes: 0.8B, 2B, 4B
+- [ ] Run full inversion pipeline at fixed same-architecture pair (e.g. dual 4B); vary initialization (random vs distilled vs alt checkpoint) where relevant
 - [ ] Query budget sweep: {10K, 50K, 100K, 500K, 1M}
 - [ ] Derive Parameter Leakage Scaling Law: fit curve to (queries, recovery%) data
-- [ ] Test: does larger student → better recovery? (capacity hypothesis)
-- [ ] Cross-architecture test: attempt inversion with Llama-3.2-1B student → Qwen teacher
+- [ ] Optional: same family, different width/depth only as **behavioral** baseline (not parameter recovery)—keep weight-recovery experiments same-architecture
+- [ ] Cross-architecture test: attempt inversion with Llama-3.2-1B student → Qwen teacher (ablation only; expect failure or behavior-only match)
 
 ### GPU Budget: ~120 GPU-hours
 ### Deliverable: Scaling law plots, cross-architecture results
