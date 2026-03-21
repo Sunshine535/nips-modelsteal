@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Activate venv if available
+_PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -f "$_PROJ_ROOT/.venv/bin/activate" ]; then source "$_PROJ_ROOT/.venv/bin/activate"; fi
+export PATH="$HOME/.local/bin:$PATH"
+
 # Progressive Parameter Inversion — Full Pipeline Launcher (8x A100)
 
 export HF_ENDPOINT="https://hf-mirror.com"

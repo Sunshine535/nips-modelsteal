@@ -20,6 +20,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/gpu_utils.sh"
 auto_setup
 
+# --- Activate project venv (created by setup.sh) ---
+PROJ_DIR_ROOT="$(dirname "$SCRIPT_DIR")"
+if [ -f "$PROJ_DIR_ROOT/.venv/bin/activate" ]; then
+    source "$PROJ_DIR_ROOT/.venv/bin/activate"
+fi
+export PATH="$HOME/.local/bin:$PATH"
+
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
