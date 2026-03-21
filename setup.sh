@@ -1,63 +1,59 @@
 #!/bin/bash
-set -euo pipefail
-
-ENV_NAME="${1:-modelsteal}"
-PYTHON_VERSION="3.10"
+set -e
+PROJ_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_NAME="nips-modelsteal"
 
 echo "============================================"
-echo " Progressive Parameter Inversion — One-Click Setup"
-echo " Conda env: $ENV_NAME | Python $PYTHON_VERSION"
+echo " Environment Setup (uv + PyTorch 2.10 + CUDA 12.8)"
 echo "============================================"
 
-# Step 1: Create conda environment
-if conda info --envs 2>/dev/null | grep -q "^${ENV_NAME} "; then
-    echo "[SKIP] Conda env '$ENV_NAME' already exists."
+# --- Install uv if missing ---
+if ! command -v uv &>/dev/null; then
+    echo "[1/5] Installing uv ..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
 else
-    echo "[1/4] Creating conda environment..."
-    conda create -n "$ENV_NAME" python="$PYTHON_VERSION" -y
+    echo "[1/5] uv already installed: $(uv --version)"
 fi
 
-# Activate
-eval "$(conda shell.bash hook)"
-conda activate "$ENV_NAME"
-echo "  Python: $(python --version)"
+# --- Create venv ---
+VENV_DIR="$PROJ_DIR/.venv"
+if [ ! -d "$VENV_DIR" ]; then
+    echo "[2/5] Creating Python 3.10 venv ..."
+    uv venv "$VENV_DIR" --python 3.10 2>/dev/null || uv venv "$VENV_DIR"
+else
+    echo "[2/5] Venv exists: $VENV_DIR"
+fi
+source "$VENV_DIR/bin/activate"
 
-# Step 2: Install PyTorch with CUDA 12.1
-echo "[2/4] Installing PyTorch 2.4.0 + CUDA 12.1..."
-pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+# --- Install PyTorch 2.10 + CUDA 12.8 ---
+echo "[3/5] Installing PyTorch 2.10.0 + CUDA 12.8 ..."
+uv pip install "torch==2.10.0" "torchvision" "torchaudio" \
+    --index-url https://download.pytorch.org/whl/cu128
 
-# Step 3: Install project dependencies
-echo "[3/4] Installing project dependencies..."
-pip install -r requirements.txt
+# --- Install project dependencies (alibaba mirror) ---
+echo "[4/5] Installing project dependencies ..."
+uv pip install -r "$PROJ_DIR/requirements.txt" \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    --extra-index-url https://download.pytorch.org/whl/cu128
 
-# Step 4: Optional flash-attn
-echo "[4/4] Installing flash-attn (optional, may take a few minutes)..."
-pip install flash-attn --no-build-isolation 2>/dev/null && \
-    echo "  flash-attn installed successfully." || \
-    echo "  [WARN] flash-attn installation failed — not critical, continuing."
+# --- Optional: flash-attention ---
+echo "[5/5] Installing flash-attn (optional) ..."
+uv pip install flash-attn --no-build-isolation 2>/dev/null || echo "  flash-attn skipped (optional)"
 
-# Verify CUDA
+# --- Verify ---
 echo ""
-echo "============================================"
-echo " Verifying CUDA availability"
 echo "============================================"
 python -c "
 import torch
-print(f'  PyTorch version : {torch.__version__}')
-print(f'  CUDA available  : {torch.cuda.is_available()}')
-if torch.cuda.is_available():
-    print(f'  CUDA version    : {torch.version.cuda}')
-    print(f'  GPU count       : {torch.cuda.device_count()}')
-    for i in range(torch.cuda.device_count()):
-        print(f'  GPU {i}           : {torch.cuda.get_device_name(i)}')
-else:
-    print('  [WARN] No CUDA GPUs detected. CPU-only mode.')
+print(f'  PyTorch  : {torch.__version__}')
+print(f'  CUDA     : {torch.version.cuda}')
+print(f'  GPUs     : {torch.cuda.device_count()}')
+for i in range(torch.cuda.device_count()):
+    print(f'    GPU {i}: {torch.cuda.get_device_name(i)}')
 "
-
+echo "============================================"
 echo ""
-echo "============================================"
-echo " Setup complete!"
-echo " Usage:"
-echo "   conda activate $ENV_NAME"
-echo "   bash scripts/run_all_experiments.sh"
-echo "============================================"
+echo "Setup complete!"
+echo "  Activate:  source $VENV_DIR/bin/activate"
+echo "  Run:       bash scripts/run_all_experiments.sh"
