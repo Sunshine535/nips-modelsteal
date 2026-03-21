@@ -44,7 +44,7 @@ while [[ $# -gt 0 ]]; do
         --skip_inversion)   SKIP_INVERSION=true; shift ;;
         --skip_defense)     SKIP_DEFENSE=true; shift ;;
         --seed)             SEED="$2"; shift 2 ;;
-        *)                  echo "Unknown arg: $1"; exit 1 ;;
+        *)                  echo "WARNING: Unknown arg: $1 (ignored)"; shift ;;
     esac
 done
 
