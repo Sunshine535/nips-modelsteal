@@ -89,35 +89,44 @@ def build_query_dataset(tokenizer, num_queries: int, max_seq_len: int, seed: int
 
 
 @torch.no_grad()
-def collect_teacher_logits(teacher_model, dataset, batch_size, device, temperature=1.0):
-    """Query teacher and collect full logits (sparse top-K for memory)."""
+def collect_teacher_logits(teacher_model, dataset, batch_size, device, temperature=1.0, topk=128):
+    """Query teacher and collect top-K logits only (sparse storage to save memory)."""
     teacher_model.eval()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    all_input_ids, all_targets = [], []
+    all_input_ids, all_topk_probs, all_topk_indices = [], [], []
 
     for (batch_ids,) in tqdm(loader, desc="Collecting teacher logits"):
         batch_ids = batch_ids.to(device)
         logits = teacher_model(batch_ids).logits
-
         soft = F.softmax(logits / temperature, dim=-1)
-        topk = 128
+        del logits
+
         values, indices = soft.topk(topk, dim=-1)
-        sparse = torch.zeros_like(soft)
-        sparse.scatter_(-1, indices, values)
-        sparse = sparse / sparse.sum(dim=-1, keepdim=True)
+        del soft
+        values = values / values.sum(dim=-1, keepdim=True)
 
         all_input_ids.append(batch_ids.cpu())
-        all_targets.append(sparse.cpu().half())
+        all_topk_probs.append(values.cpu().half())
+        all_topk_indices.append(indices.cpu())
+        torch.cuda.empty_cache()
 
-    return TensorDataset(torch.cat(all_input_ids), torch.cat(all_targets))
+    return TensorDataset(
+        torch.cat(all_input_ids),
+        torch.cat(all_topk_probs),
+        torch.cat(all_topk_indices),
+    )
 
 
 def train_kd_student(
     student_model, train_dataset, args, rank=0, world_size=1,
 ):
-    """Train student via KL divergence distillation from teacher logits."""
+    """Train student via KL divergence distillation from sparse top-K teacher logits."""
     device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
     student_model = student_model.to(device)
+
+    if hasattr(student_model, "gradient_checkpointing_enable"):
+        student_model.gradient_checkpointing_enable()
+        logger.info("Gradient checkpointing enabled")
 
     if world_size > 1:
         student_model = DDP(student_model, device_ids=[rank])
@@ -132,13 +141,14 @@ def train_kd_student(
         student_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay,
     )
 
-    total_steps = len(loader) * args.num_epochs
-    warmup_steps = int(total_steps * args.warmup_ratio)
+    grad_accum = args.gradient_accumulation_steps
+    total_opt_steps = (len(loader) // grad_accum) * args.num_epochs
+    warmup_steps = int(total_opt_steps * args.warmup_ratio)
 
     def lr_lambda(step):
         if step < warmup_steps:
             return step / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_opt_steps - warmup_steps)
         return max(0.01, 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)).item()))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -156,43 +166,60 @@ def train_kd_student(
         student_model.train()
         epoch_loss = 0.0
         num_batches = 0
+        optimizer.zero_grad()
 
-        for batch_ids, batch_targets in tqdm(
+        for micro_step, (batch_ids, topk_probs, topk_indices) in enumerate(tqdm(
             loader, desc=f"KD Epoch {epoch+1}/{args.num_epochs}", disable=(rank != 0)
-        ):
+        )):
             batch_ids = batch_ids.to(device)
-            batch_targets = batch_targets.to(device).float()
+            topk_probs = topk_probs.to(device).float()
+            topk_indices = topk_indices.to(device)
 
-            student_logits = student_model(batch_ids).logits
-            student_log_probs = F.log_softmax(student_logits / args.temperature, dim=-1)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                student_logits = student_model(batch_ids).logits
 
-            kl_loss = F.kl_div(student_log_probs, batch_targets, reduction="batchmean")
+            scaled = student_logits.float() / args.temperature
+            log_z = scaled.logsumexp(dim=-1, keepdim=True)
+            student_log_probs_topk = scaled.gather(-1, topk_indices) - log_z
+            del scaled, log_z
+
+            kl_loss = F.kl_div(student_log_probs_topk, topk_probs, reduction="batchmean")
             loss = kl_loss * (args.temperature ** 2)
+            del student_log_probs_topk
 
-            # Hard-label cross-entropy as auxiliary
-            hard_labels = batch_targets.argmax(dim=-1)
+            hard_labels = topk_indices[..., 0]
             ce_loss = F.cross_entropy(
-                student_logits.view(-1, student_logits.size(-1)),
+                student_logits.float().view(-1, student_logits.size(-1)),
                 hard_labels.view(-1),
             )
-            total_loss = args.alpha * loss + (1 - args.alpha) * ce_loss
+            del student_logits, topk_probs, topk_indices
 
-            optimizer.zero_grad()
+            total_loss = (args.alpha * loss + (1 - args.alpha) * ce_loss) / grad_accum
             total_loss.backward()
+
+            epoch_loss += total_loss.item() * grad_accum
+            num_batches += 1
+
+            if (micro_step + 1) % grad_accum == 0:
+                torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
+
+                if rank == 0 and global_step % 100 == 0:
+                    logger.info(
+                        "Step %d | kl=%.4f | ce=%.4f | total=%.4f | lr=%.2e",
+                        global_step, kl_loss.item(), ce_loss.item(),
+                        total_loss.item() * grad_accum, scheduler.get_last_lr()[0],
+                    )
+
+        if (micro_step + 1) % grad_accum != 0:
             torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
-
-            epoch_loss += total_loss.item()
-            num_batches += 1
+            optimizer.zero_grad()
             global_step += 1
-
-            if rank == 0 and global_step % 100 == 0:
-                logger.info(
-                    "Step %d | kl=%.4f | ce=%.4f | total=%.4f | lr=%.2e",
-                    global_step, loss.item(), ce_loss.item(),
-                    total_loss.item(), scheduler.get_last_lr()[0],
-                )
 
         avg_loss = epoch_loss / max(1, num_batches)
         metrics_log.append({
@@ -233,7 +260,8 @@ def parse_args():
     parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3.5-4B")
     parser.add_argument("--student_model", type=str, default="Qwen/Qwen3.5-4B")
     parser.add_argument("--query_budget", type=int, default=500000)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=2.0)
     parser.add_argument("--alpha", type=float, default=0.7,
                         help="Weight for KL loss vs CE loss")

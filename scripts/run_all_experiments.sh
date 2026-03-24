@@ -70,7 +70,8 @@ if [ "$SKIP_KD" = false ]; then
         python scripts/run_kd_baseline.py \
             --config "$CONFIG" \
             --query_budget 500000 \
-            --batch_size 32 \
+            --batch_size 4 \
+            --gradient_accumulation_steps 8 \
             --temperature 2.0 \
             --alpha 0.7 \
             --num_epochs 3 \
