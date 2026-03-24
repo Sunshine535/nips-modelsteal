@@ -118,10 +118,10 @@ def collect_teacher_logits(teacher_model, dataset, batch_size, device, temperatu
 
 
 def train_kd_student(
-    student_model, train_dataset, args, rank=0, world_size=1,
+    student_model, train_dataset, args, rank=0, world_size=1, local_rank=0,
 ):
     """Train student via KL divergence distillation from sparse top-K teacher logits."""
-    device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
+    device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
     student_model = student_model.to(device)
 
     if hasattr(student_model, "gradient_checkpointing_enable"):
@@ -129,7 +129,7 @@ def train_kd_student(
         logger.info("Gradient checkpointing enabled")
 
     if world_size > 1:
-        student_model = DDP(student_model, device_ids=[rank])
+        student_model = DDP(student_model, device_ids=[local_rank])
 
     sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank) if world_size > 1 else None
     loader = DataLoader(
@@ -292,50 +292,44 @@ def main():
     device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
 
     logger.info("=== Knowledge Distillation Baseline ===")
-    logger.info("Teacher: %s → Student: %s", args.teacher_model, args.student_model)
-    logger.info("Query budget: %d, Temperature: %.1f, Alpha: %.2f",
-                args.query_budget, args.temperature, args.alpha)
-
-    logger.info("Loading teacher: %s", args.teacher_model)
-    teacher_model = AutoModelForCausalLM.from_pretrained(
-        args.teacher_model, torch_dtype=torch.bfloat16,
-        device_map={"": device}, trust_remote_code=True,
-    )
+    logger.info("Teacher: %s → Student: %s (rank %d/%d)", args.teacher_model, args.student_model, rank, world_size)
 
     tokenizer = AutoTokenizer.from_pretrained(args.teacher_model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    num_queries = min(args.query_budget, args.query_budget // args.max_seq_len)
-    logger.info("Building query dataset (%d queries)...", num_queries)
-    query_dataset = build_query_dataset(tokenizer, num_queries, args.max_seq_len, args.seed)
-
     if rank == 0:
-        logger.info("Collecting teacher logits...")
+        num_queries = min(args.query_budget, args.query_budget // args.max_seq_len)
+        logger.info("Loading teacher: %s", args.teacher_model)
+        teacher_model = AutoModelForCausalLM.from_pretrained(
+            args.teacher_model, torch_dtype=torch.bfloat16,
+            device_map={"": device}, trust_remote_code=True,
+        )
+        logger.info("Building query dataset (%d queries)...", num_queries)
+        query_dataset = build_query_dataset(tokenizer, num_queries, args.max_seq_len, args.seed)
+        logger.info("Collecting teacher logits (batch_size=32)...")
         distill_dataset = collect_teacher_logits(
-            teacher_model, query_dataset, args.batch_size, device, args.temperature,
+            teacher_model, query_dataset, batch_size=32, device=device, temperature=args.temperature,
         )
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         torch.save(distill_dataset, Path(args.output_dir) / "distill_dataset.pt")
-    else:
-        distill_dataset = None
+        del teacher_model, query_dataset
+        torch.cuda.empty_cache()
 
     if world_size > 1:
         dist.barrier()
         if rank != 0:
-            distill_dataset = torch.load(Path(args.output_dir) / "distill_dataset.pt")
-
-    del teacher_model
-    torch.cuda.empty_cache()
+            distill_dataset = torch.load(
+                Path(args.output_dir) / "distill_dataset.pt", weights_only=False,
+            )
 
     logger.info("Loading student: %s (random init)", args.student_model)
     student_model = AutoModelForCausalLM.from_pretrained(
         args.student_model, torch_dtype=torch.bfloat16, trust_remote_code=True,
     )
-    # Re-initialize weights to simulate random init
     student_model.apply(lambda m: m.reset_parameters() if hasattr(m, "reset_parameters") else None)
 
-    train_kd_student(student_model, distill_dataset, args, rank, world_size)
+    train_kd_student(student_model, distill_dataset, args, rank, world_size, local_rank)
 
     if rank == 0:
         tokenizer.save_pretrained(Path(args.output_dir) / "best_student")

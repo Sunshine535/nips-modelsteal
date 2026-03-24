@@ -47,6 +47,7 @@ while [[ $# -gt 0 ]]; do
         --skip_kd)          SKIP_KD=true; shift ;;
         --skip_inversion)   SKIP_INVERSION=true; shift ;;
         --skip_defense)     SKIP_DEFENSE=true; shift ;;
+        --gpus)             export NUM_GPUS="$2"; shift 2 ;;
         --seed)             SEED="$2"; shift 2 ;;
         *)                  echo "WARNING: Unknown arg: $1 (ignored)"; shift ;;
     esac
@@ -54,6 +55,7 @@ done
 
 mkdir -p "$RESULTS_DIR" "$LOG_DIR"
 
+TORCHRUN="$(get_torchrun_cmd "$NUM_GPUS")"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 run_timed() {
     local name="$1"; shift
@@ -64,10 +66,12 @@ run_timed() {
     log "DONE:  $name (${elapsed}s)"
 }
 
-# ── Step 1: Knowledge Distillation Baseline ──────────────────────────
+log "Using $NUM_GPUS GPU(s). TORCHRUN: $TORCHRUN"
+
+# ── Step 1: KD Baseline (DDP across all GPUs) ───────────────────────
 if [ "$SKIP_KD" = false ]; then
     run_timed "01_kd_baseline" \
-        python scripts/run_kd_baseline.py \
+        $TORCHRUN scripts/run_kd_baseline.py \
             --config "$CONFIG" \
             --query_budget 500000 \
             --batch_size 4 \
@@ -79,19 +83,52 @@ if [ "$SKIP_KD" = false ]; then
             --seed "$SEED"
 fi
 
-# ── Step 2: Progressive Inversion (3 strategies) ────────────────────
+# ── Step 2: Progressive Inversion (strategies in parallel on separate GPUs) ──
 if [ "$SKIP_INVERSION" = false ]; then
-    run_timed "02_progressive_inversion" \
-        python scripts/run_progressive_inversion.py \
+    log "START: 02_progressive_inversion (3 strategies in parallel)"
+    STRATEGIES=(random gradient_magnitude fisher_information)
+    PIDS=()
+    for i in "${!STRATEGIES[@]}"; do
+        log "  GPU $i ← strategy=${STRATEGIES[$i]}"
+        CUDA_VISIBLE_DEVICES=$i python scripts/run_progressive_inversion.py \
             --config "$CONFIG" \
             --query_budget 500000 \
             --batch_size 64 \
             --learning_rate 1e-4 \
             --max_steps_per_layer 10000 \
             --query_pool_size 10000 \
-            --strategies random gradient_magnitude fisher_information \
+            --strategies "${STRATEGIES[$i]}" \
             --output_dir "$RESULTS_DIR/progressive_inversion" \
-            --seed "$SEED"
+            --seed "$SEED" \
+            > "$LOG_DIR/02_strategy_${STRATEGIES[$i]}.log" 2>&1 &
+        PIDS+=($!)
+    done
+
+    FAIL=0
+    for j in "${!PIDS[@]}"; do
+        wait "${PIDS[$j]}" || { log "ERROR: strategy ${STRATEGIES[$j]} failed (pid=${PIDS[$j]})"; FAIL=1; }
+    done
+    if [ $FAIL -ne 0 ]; then exit 1; fi
+
+    # Merge per-strategy summaries into combined comparison JSON
+    python3 -c "
+import json; from pathlib import Path
+strats = ['random', 'gradient_magnitude', 'fisher_information']
+d = Path('$RESULTS_DIR/progressive_inversion')
+comp = {'strategies': {}, 'query_budget': 500000}
+for s in strats:
+    p = d / f'strategy_{s}' / 'inversion_summary.json'
+    if p.exists():
+        r = json.loads(p.read_text())
+        comp['strategies'][s] = dict(
+            total_queries=r['total_queries'],
+            final_top1_match=r['final_downstream']['top1_match_rate'],
+            final_kl_divergence=r['final_downstream']['mean_kl_divergence'],
+            num_phases=len(r['phases']))
+(d / 'strategy_comparison.json').write_text(json.dumps(comp, indent=2))
+print('  Strategy comparison merged.')
+"
+    log "DONE:  02_progressive_inversion"
 fi
 
 # ── Step 3: Recovery Quality Evaluation ──────────────────────────────
@@ -115,18 +152,27 @@ if [ "$SKIP_DEFENSE" = false ]; then
             --seed "$SEED"
 fi
 
-# ── Step 5: Scaling Analysis (vary query budget) ─────────────────────
-log "START: 05_scaling_analysis"
-for BUDGET in 50000 100000 250000 500000; do
-    log "  Scaling: budget=$BUDGET"
-    python scripts/run_progressive_inversion.py \
+# ── Step 5: Scaling Analysis (parallel budgets on separate GPUs) ──────
+log "START: 05_scaling_analysis (4 budgets in parallel)"
+BUDGETS=(50000 100000 250000 500000)
+PIDS=()
+for i in "${!BUDGETS[@]}"; do
+    log "  GPU $i ← budget=${BUDGETS[$i]}"
+    CUDA_VISIBLE_DEVICES=$i python scripts/run_progressive_inversion.py \
         --config "$CONFIG" \
-        --query_budget "$BUDGET" \
+        --query_budget "${BUDGETS[$i]}" \
         --strategies gradient_magnitude \
-        --output_dir "$RESULTS_DIR/scaling/budget_${BUDGET}" \
+        --output_dir "$RESULTS_DIR/scaling/budget_${BUDGETS[$i]}" \
         --seed "$SEED" \
-        2>&1 | tee "$LOG_DIR/05_scaling_${BUDGET}.log"
+        > "$LOG_DIR/05_scaling_${BUDGETS[$i]}.log" 2>&1 &
+    PIDS+=($!)
 done
+
+FAIL=0
+for j in "${!PIDS[@]}"; do
+    wait "${PIDS[$j]}" || { log "ERROR: scaling budget=${BUDGETS[$j]} failed"; FAIL=1; }
+done
+if [ $FAIL -ne 0 ]; then exit 1; fi
 log "DONE:  05_scaling_analysis"
 
 # ── Step 6: Eval existing distillation baseline (reuse existing) ─────
