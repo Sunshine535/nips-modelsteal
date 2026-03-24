@@ -161,8 +161,9 @@ def run_inversion_trial(
     teacher = BlackBoxTeacher(model=teacher_raw, device=device, defense_fn=defense_fn)
 
     student = AutoModelForCausalLM.from_pretrained(
-        student_model_name, torch_dtype=torch.bfloat16, trust_remote_code=True,
-    ).to(device)
+        student_model_name, torch_dtype=torch.bfloat16,
+        device_map={"": device}, trust_remote_code=True,
+    )
     student.apply(lambda m: m.reset_parameters() if hasattr(m, "reset_parameters") else None)
 
     pool = QueryPool(tokenizer, pool_size=5000, max_seq_len=256, device=device)
@@ -307,10 +308,19 @@ def parse_args():
 
 
 def main():
+    import traceback as _tb
     args = parse_args()
     setup_logging()
     torch.manual_seed(args.seed)
 
+    try:
+        _run_main(args)
+    except Exception:
+        logger.error("FATAL: %s", _tb.format_exc())
+        raise
+
+
+def _run_main(args):
     if args.config and Path(args.config).exists():
         with open(args.config) as f:
             config = yaml.safe_load(f)

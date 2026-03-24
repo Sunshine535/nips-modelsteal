@@ -91,7 +91,38 @@ fi
 #   GPU 3-6: 4 scaling budgets
 #   GPU 7:   defense evaluation
 # ═══════════════════════════════════════════════════════════════════════
-log "START: Phase B (inversion + scaling + defense, 8 parallel tasks on $NUM_GPUS GPUs)"
+
+# Pre-warm: ensure model weights + dataset are cached before parallel launches
+log "Pre-warming HF model cache and dataset..."
+python3 -c "
+import torch, os, warnings; warnings.filterwarnings('ignore')
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+from transformers import AutoModelForCausalLM, AutoTokenizer
+name = None
+try:
+    import yaml
+    with open('$CONFIG') as f:
+        c = yaml.safe_load(f)
+    name = c.get('teacher', {}).get('model_name')
+except Exception:
+    pass
+name = name or 'Qwen/Qwen3.5-4B'
+print(f'  Warming cache for {name} ...')
+_ = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
+_ = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16, trust_remote_code=True)
+del _; torch.cuda.empty_cache()
+try:
+    from datasets import load_dataset
+    _ = load_dataset('wikitext', 'wikitext-103-raw-v1', split='validation', trust_remote_code=True)
+    print('  Dataset cached.')
+except Exception as e:
+    print(f'  Dataset cache failed (will use random pool): {e}')
+print('  Cache warm-up done.')
+" 2>&1 | tee "$LOG_DIR/00_cache_warmup.log"
+log "Cache warm-up complete"
+
+STAGGER_SECS="${STAGGER_SECS:-5}"
+log "START: Phase B (inversion + scaling + defense, 8 parallel tasks on $NUM_GPUS GPUs, stagger=${STAGGER_SECS}s)"
 GPU_IDX=0
 PIDS=()
 LABELS=()
@@ -114,6 +145,7 @@ if [ "$SKIP_INVERSION" = false ]; then
             > "$LOG_DIR/02_strategy_${s}.log" 2>&1 &
         PIDS+=($!); LABELS+=("strategy_$s")
         GPU_IDX=$((GPU_IDX + 1))
+        sleep "$STAGGER_SECS"
     done
 fi
 
@@ -130,6 +162,7 @@ for b in "${BUDGETS[@]}"; do
         > "$LOG_DIR/05_scaling_${b}.log" 2>&1 &
     PIDS+=($!); LABELS+=("budget_$b")
     GPU_IDX=$((GPU_IDX + 1))
+    sleep "$STAGGER_SECS"
 done
 
 # --- 1 defense evaluation ---
@@ -148,10 +181,28 @@ fi
 
 # Wait for all Phase B tasks
 FAIL=0
+FAIL_LABELS=()
 for j in "${!PIDS[@]}"; do
-    wait "${PIDS[$j]}" || { log "ERROR: ${LABELS[$j]} failed (pid=${PIDS[$j]})"; FAIL=1; }
+    if ! wait "${PIDS[$j]}"; then
+        log "ERROR: ${LABELS[$j]} failed (pid=${PIDS[$j]})"
+        log "  Log: $LOG_DIR (check the corresponding .log file for traceback)"
+        FAIL=1
+        FAIL_LABELS+=("${LABELS[$j]}")
+    fi
 done
-if [ $FAIL -ne 0 ]; then exit 1; fi
+if [ $FAIL -ne 0 ]; then
+    log "Phase B failures: ${FAIL_LABELS[*]}"
+    log "Dumping last 30 lines of each failed log:"
+    for fl in "${FAIL_LABELS[@]}"; do
+        for logf in "$LOG_DIR"/02_strategy_*.log "$LOG_DIR"/05_scaling_*.log "$LOG_DIR"/04_defense_eval.log; do
+            if [[ "$logf" == *"$fl"* ]] || [[ "$fl" == *"$(basename "$logf" .log | sed 's/^[0-9]*_//')"* ]]; then
+                log "--- $logf (last 30 lines) ---"
+                tail -30 "$logf" 2>/dev/null || true
+            fi
+        done
+    done
+    exit 1
+fi
 
 # Merge per-strategy summaries into combined comparison JSON
 if [ "$SKIP_INVERSION" = false ]; then

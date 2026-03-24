@@ -70,15 +70,18 @@ def extract_ground_truth(model):
     return gt
 
 
-def build_query_pool(tokenizer, pool_size, max_seq_len, device, seed=42):
+def build_query_pool(tokenizer, pool_size, max_seq_len, device, seed=42, dataset_cache=None):
     pool = QueryPool(
         tokenizer=tokenizer, pool_size=pool_size,
         max_seq_len=max_seq_len, device=device, seed=seed,
     )
     try:
-        from datasets import load_dataset
-        ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="validation", trust_remote_code=True)
-        pool.build_from_dataset(ds, text_column="text")
+        if dataset_cache is not None:
+            pool.build_from_dataset(dataset_cache, text_column="text")
+        else:
+            from datasets import load_dataset
+            ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="validation", trust_remote_code=True)
+            pool.build_from_dataset(ds, text_column="text")
     except Exception as e:
         logger.warning("Dataset load failed: %s. Using random pool.", e)
         pool.build_random(tokenizer.vocab_size)
@@ -227,14 +230,16 @@ def run_full_inversion(
     strategy_dir.mkdir(parents=True, exist_ok=True)
 
     student_model = AutoModelForCausalLM.from_pretrained(
-        student_model_name, torch_dtype=torch.bfloat16, trust_remote_code=True,
-    ).to(device)
+        student_model_name, torch_dtype=torch.bfloat16,
+        device_map={"": device}, trust_remote_code=True,
+    )
     student_model.apply(lambda m: m.reset_parameters() if hasattr(m, "reset_parameters") else None)
 
     teacher = BlackBoxTeacher(model=teacher_model, device=device)
 
     query_pool = build_query_pool(
         tokenizer, args.query_pool_size, args.max_seq_len, device, args.seed,
+        dataset_cache=getattr(args, '_dataset_cache', None),
     )
 
     per_phase_budget = args.query_budget // 3
@@ -367,11 +372,23 @@ def parse_args():
 
 
 def main():
+    import traceback as _tb
     args = parse_args()
     rank, world_size, local_rank = setup_distributed()
     setup_logging(rank)
     torch.manual_seed(args.seed)
 
+    try:
+        _run_main(args, rank, world_size, local_rank)
+    except Exception:
+        logger.error("FATAL: %s", _tb.format_exc())
+        raise
+    finally:
+        if world_size > 1:
+            dist.destroy_process_group()
+
+
+def _run_main(args, rank, world_size, local_rank):
     if args.config and Path(args.config).exists():
         with open(args.config) as f:
             config = yaml.safe_load(f)
@@ -395,6 +412,17 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.teacher_model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    logger.info("Pre-loading dataset for query pool...")
+    try:
+        from datasets import load_dataset
+        args._dataset_cache = load_dataset(
+            "wikitext", "wikitext-103-raw-v1", split="validation",
+            trust_remote_code=True,
+        )
+    except Exception as e:
+        logger.warning("Dataset pre-load failed: %s (will use random pool)", e)
+        args._dataset_cache = None
 
     logger.info("Extracting ground-truth weights...")
     ground_truth = extract_ground_truth(teacher_model)
@@ -428,9 +456,6 @@ def main():
     for s, r in comparison["strategies"].items():
         logger.info("  %s: top1=%.4f, kl=%.6f, queries=%d",
                      s, r["final_top1_match"], r["final_kl_divergence"], r["total_queries"])
-
-    if world_size > 1:
-        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
