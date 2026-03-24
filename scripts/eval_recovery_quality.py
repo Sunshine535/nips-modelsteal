@@ -19,6 +19,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 from collections import defaultdict
@@ -29,6 +30,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
 from tqdm import tqdm
@@ -39,10 +41,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 logger = logging.getLogger(__name__)
 
 
-def setup_logging():
+def setup_distributed():
+    if "RANK" in os.environ:
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        return rank, world_size, local_rank
+    return 0, 1, 0
+
+
+def setup_logging(rank: int = 0):
     logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] %(levelname)s: %(message)s",
+        level=logging.INFO if rank == 0 else logging.WARNING,
+        format=f"[%(asctime)s][Rank {rank}] %(levelname)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -131,8 +144,9 @@ def aggregate_weight_metrics(per_layer):
 
 @torch.no_grad()
 def compute_output_metrics(teacher, recovered, tokenizer, device,
-                           num_samples=2000, batch_size=16, seq_len=256):
-    """KL divergence, top-k agreement, exact match rate."""
+                           num_samples=2000, batch_size=16, seq_len=256,
+                           rank=0, world_size=1):
+    """KL divergence, top-k agreement, exact match rate (DDP-aware)."""
     teacher.eval()
     recovered.eval()
     vocab_size = tokenizer.vocab_size
@@ -140,17 +154,24 @@ def compute_output_metrics(teacher, recovered, tokenizer, device,
 
     total_tokens = 0
     total_top1_match = 0
-    total_top5_overlap = 0
-    total_top10_overlap = 0
+    total_top5_overlap = 0.0
+    total_top10_overlap = 0.0
     total_kl = 0.0
     total_reverse_kl = 0.0
     total_exact_seq_match = 0
     total_seqs = 0
 
-    for start in tqdm(range(0, num_samples, batch_size), desc="Output metrics"):
+    batch_idx = 0
+    for start in tqdm(range(0, num_samples, batch_size), desc="Output metrics", disable=(rank != 0)):
         bsz = min(batch_size, num_samples - start)
-        input_ids = torch.randint(3, vocab_size, (bsz, seq_len), generator=rng).to(device)
+        input_ids = torch.randint(3, vocab_size, (bsz, seq_len), generator=rng)
 
+        if batch_idx % world_size != rank:
+            batch_idx += 1
+            continue
+        batch_idx += 1
+
+        input_ids = input_ids.to(device)
         t_logits = teacher(input_ids).logits
         r_logits = recovered(input_ids).logits
 
@@ -164,46 +185,51 @@ def compute_output_metrics(teacher, recovered, tokenizer, device,
         r_top10 = r_logits.topk(10, dim=-1).indices
 
         for i in range(bsz):
-            seq_match = (t_preds[i] == r_preds[i]).all().item()
-            total_exact_seq_match += seq_match
+            total_exact_seq_match += (t_preds[i] == r_preds[i]).all().item()
             total_seqs += 1
-
             for j in range(seq_len):
                 t5 = set(t_top5[i, j].tolist())
                 r5 = set(r_top5[i, j].tolist())
                 total_top5_overlap += len(t5 & r5) / 5.0
-
                 t10 = set(t_top10[i, j].tolist())
                 r10 = set(r_top10[i, j].tolist())
                 total_top10_overlap += len(t10 & r10) / 10.0
 
         t_probs = F.softmax(t_logits, dim=-1)
         r_log_probs = F.log_softmax(r_logits, dim=-1)
-        kl = F.kl_div(r_log_probs, t_probs, reduction="sum").item()
-        total_kl += kl
+        total_kl += F.kl_div(r_log_probs, t_probs, reduction="sum").item()
 
         r_probs = F.softmax(r_logits, dim=-1)
         t_log_probs = F.log_softmax(t_logits, dim=-1)
-        rev_kl = F.kl_div(t_log_probs, r_probs, reduction="sum").item()
-        total_reverse_kl += rev_kl
+        total_reverse_kl += F.kl_div(t_log_probs, r_probs, reduction="sum").item()
 
         total_tokens += bsz * seq_len
 
+    if world_size > 1:
+        counters = torch.tensor(
+            [total_top1_match, total_top5_overlap, total_top10_overlap,
+             total_kl, total_reverse_kl, total_exact_seq_match, total_seqs, total_tokens],
+            dtype=torch.float64, device=device,
+        )
+        dist.all_reduce(counters, op=dist.ReduceOp.SUM)
+        (total_top1_match, total_top5_overlap, total_top10_overlap,
+         total_kl, total_reverse_kl, total_exact_seq_match, total_seqs, total_tokens) = counters.tolist()
+
     return {
-        "top1_match_rate": total_top1_match / total_tokens,
-        "top5_overlap_rate": total_top5_overlap / total_tokens,
-        "top10_overlap_rate": total_top10_overlap / total_tokens,
-        "mean_kl_divergence": total_kl / total_tokens,
-        "mean_reverse_kl": total_reverse_kl / total_tokens,
-        "exact_sequence_match_rate": total_exact_seq_match / total_seqs,
+        "top1_match_rate": total_top1_match / max(total_tokens, 1),
+        "top5_overlap_rate": total_top5_overlap / max(total_tokens, 1),
+        "top10_overlap_rate": total_top10_overlap / max(total_tokens, 1),
+        "mean_kl_divergence": total_kl / max(total_tokens, 1),
+        "mean_reverse_kl": total_reverse_kl / max(total_tokens, 1),
+        "exact_sequence_match_rate": total_exact_seq_match / max(total_seqs, 1),
     }
 
 
 # ── Downstream Benchmarks ────────────────────────────────────────────
 
 @torch.no_grad()
-def evaluate_gsm8k(model, tokenizer, device, max_samples=200):
-    """Evaluate on GSM8K (math reasoning)."""
+def evaluate_gsm8k(model, tokenizer, device, max_samples=200, rank=0, world_size=1):
+    """Evaluate on GSM8K (math reasoning) — DDP-aware sample splitting."""
     try:
         from datasets import load_dataset
         ds = load_dataset("openai/gsm8k", "main", split="test", trust_remote_code=True)
@@ -217,6 +243,8 @@ def evaluate_gsm8k(model, tokenizer, device, max_samples=200):
     for i, ex in enumerate(ds):
         if i >= max_samples:
             break
+        if i % world_size != rank:
+            continue
         question = ex.get("question", "")
         answer_str = ex.get("answer", "")
         match = re.search(r"####\s*(-?\d[\d,]*)", answer_str)
@@ -239,14 +267,19 @@ def evaluate_gsm8k(model, tokenizer, device, max_samples=200):
             correct += 1
         total += 1
 
+    if world_size > 1:
+        counters = torch.tensor([correct, total], dtype=torch.float64, device=device)
+        dist.all_reduce(counters, op=dist.ReduceOp.SUM)
+        correct, total = int(counters[0].item()), int(counters[1].item())
+
     acc = correct / max(total, 1)
     logger.info("GSM8K: %d/%d = %.4f", correct, total, acc)
     return {"accuracy": acc, "correct": correct, "total": total}
 
 
 @torch.no_grad()
-def evaluate_mmlu(model, tokenizer, device, max_samples=200):
-    """Evaluate on MMLU (multiple choice)."""
+def evaluate_mmlu(model, tokenizer, device, max_samples=200, rank=0, world_size=1):
+    """Evaluate on MMLU (multiple choice) — DDP-aware sample splitting."""
     try:
         from datasets import load_dataset
         ds = load_dataset("cais/mmlu", "all", split="test", trust_remote_code=True)
@@ -261,6 +294,8 @@ def evaluate_mmlu(model, tokenizer, device, max_samples=200):
     for i, ex in enumerate(ds):
         if i >= max_samples:
             break
+        if i % world_size != rank:
+            continue
         question = ex.get("question", "")
         choices = ex.get("choices", [])
         answer_idx = ex.get("answer", -1)
@@ -281,6 +316,11 @@ def evaluate_mmlu(model, tokenizer, device, max_samples=200):
         if pred == gold:
             correct += 1
         total += 1
+
+    if world_size > 1:
+        counters = torch.tensor([correct, total], dtype=torch.float64, device=device)
+        dist.all_reduce(counters, op=dist.ReduceOp.SUM)
+        correct, total = int(counters[0].item()), int(counters[1].item())
 
     acc = correct / max(total, 1)
     logger.info("MMLU: %d/%d = %.4f", correct, total, acc)
@@ -401,18 +441,19 @@ def load_model(path, device):
 
 def main():
     args = parse_args()
-    setup_logging()
+    rank, world_size, local_rank = setup_distributed()
+    setup_logging(rank)
 
     if args.config and Path(args.config).exists():
         with open(args.config) as f:
             config = yaml.safe_load(f)
         args.teacher_model = config.get("teacher", {}).get("model_name", args.teacher_model)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Loading teacher: %s", args.teacher_model)
+    logger.info("Loading teacher: %s (rank %d/%d)", args.teacher_model, rank, world_size)
     teacher = load_model(args.teacher_model, device)
 
     tokenizer = AutoTokenizer.from_pretrained(args.teacher_model, trust_remote_code=True)
@@ -421,41 +462,42 @@ def main():
 
     results = {"teacher_model": args.teacher_model}
 
-    models_to_eval = {}
+    model_paths = {}
     if Path(args.kd_model).exists():
-        logger.info("Loading KD model: %s", args.kd_model)
-        models_to_eval["kd_baseline"] = load_model(args.kd_model, device)
+        model_paths["kd_baseline"] = args.kd_model
     else:
         logger.warning("KD model not found: %s", args.kd_model)
-
     if Path(args.inversion_model).exists():
-        logger.info("Loading inversion model: %s", args.inversion_model)
-        models_to_eval["progressive_inversion"] = load_model(args.inversion_model, device)
+        model_paths["progressive_inversion"] = args.inversion_model
     else:
         logger.warning("Inversion model not found: %s", args.inversion_model)
 
-    for model_name, model in models_to_eval.items():
+    for model_name, model_path in model_paths.items():
         logger.info("\n=== Evaluating: %s ===", model_name)
+        model = load_model(model_path, device)
         model_results = {}
 
-        logger.info("Computing weight-level metrics...")
-        per_layer = compute_weight_metrics(teacher, model)
-        by_component, by_block = aggregate_weight_metrics(per_layer)
-        model_results["weight_level"] = {
-            "by_component": by_component,
-            "by_block": by_block,
-        }
+        if rank == 0:
+            logger.info("Computing weight-level metrics...")
+            per_layer = compute_weight_metrics(teacher, model)
+            by_component, by_block = aggregate_weight_metrics(per_layer)
+            model_results["weight_level"] = {
+                "by_component": by_component,
+                "by_block": by_block,
+            }
+            overall_cos = np.mean([m["cosine_similarity"] for m in per_layer.values()])
+            overall_mse = np.mean([m["mse"] for m in per_layer.values()])
+            logger.info("  Weight: mean_cos=%.4f, mean_mse=%.6f", overall_cos, overall_mse)
+            plot_layer_recovery(per_layer, str(output_dir), label=model_name)
 
-        overall_cos = np.mean([m["cosine_similarity"] for m in per_layer.values()])
-        overall_mse = np.mean([m["mse"] for m in per_layer.values()])
-        logger.info("  Weight: mean_cos=%.4f, mean_mse=%.6f", overall_cos, overall_mse)
-
-        plot_layer_recovery(per_layer, str(output_dir), label=model_name)
+        if world_size > 1:
+            dist.barrier()
 
         logger.info("Computing output-level metrics...")
         output_metrics = compute_output_metrics(
             teacher, model, tokenizer, device,
             num_samples=args.num_output_samples, batch_size=args.batch_size,
+            rank=rank, world_size=world_size,
         )
         model_results["output_level"] = output_metrics
         for k, v in output_metrics.items():
@@ -463,39 +505,48 @@ def main():
 
         logger.info("Running downstream benchmarks...")
         downstream = {}
-        downstream["gsm8k"] = evaluate_gsm8k(model, tokenizer, device, args.downstream_samples)
-        downstream["mmlu"] = evaluate_mmlu(model, tokenizer, device, args.downstream_samples)
-        downstream["humaneval_proxy"] = evaluate_humaneval_proxy(model, tokenizer, device)
+        downstream["gsm8k"] = evaluate_gsm8k(
+            model, tokenizer, device, args.downstream_samples, rank, world_size)
+        downstream["mmlu"] = evaluate_mmlu(
+            model, tokenizer, device, args.downstream_samples, rank, world_size)
+        if rank == 0:
+            downstream["humaneval_proxy"] = evaluate_humaneval_proxy(model, tokenizer, device)
+        else:
+            downstream["humaneval_proxy"] = {}
+        if world_size > 1:
+            dist.barrier()
         model_results["downstream"] = downstream
 
         results[model_name] = model_results
-
         del model
         torch.cuda.empty_cache()
 
-    if "kd_baseline" in results and "progressive_inversion" in results:
-        plot_comparison(
-            results["kd_baseline"]["output_level"],
-            results["progressive_inversion"]["output_level"],
-            str(output_dir),
-        )
+    if rank == 0:
+        if "kd_baseline" in results and "progressive_inversion" in results:
+            plot_comparison(
+                results["kd_baseline"]["output_level"],
+                results["progressive_inversion"]["output_level"],
+                str(output_dir),
+            )
 
-    with open(output_dir / "recovery_evaluation.json", "w") as f:
-        json.dump(results, f, indent=2, default=str)
+        with open(output_dir / "recovery_evaluation.json", "w") as f:
+            json.dump(results, f, indent=2, default=str)
 
-    logger.info("\n=== Recovery Evaluation Summary ===")
-    for model_name in models_to_eval:
-        r = results[model_name]
-        out = r.get("output_level", {})
-        ds = r.get("downstream", {})
-        logger.info("%s:", model_name)
-        logger.info("  Output: top1=%.4f, kl=%.6f",
-                     out.get("top1_match_rate", 0), out.get("mean_kl_divergence", 0))
-        logger.info("  GSM8K: %.4f, MMLU: %.4f",
-                     ds.get("gsm8k", {}).get("accuracy", 0),
-                     ds.get("mmlu", {}).get("accuracy", 0))
+        logger.info("\n=== Recovery Evaluation Summary ===")
+        for model_name in model_paths:
+            r = results[model_name]
+            out = r.get("output_level", {})
+            ds = r.get("downstream", {})
+            logger.info("%s:", model_name)
+            logger.info("  Output: top1=%.4f, kl=%.6f",
+                         out.get("top1_match_rate", 0), out.get("mean_kl_divergence", 0))
+            logger.info("  GSM8K: %.4f, MMLU: %.4f",
+                         ds.get("gsm8k", {}).get("accuracy", 0),
+                         ds.get("mmlu", {}).get("accuracy", 0))
+        logger.info("All results saved to %s", output_dir)
 
-    logger.info("All results saved to %s", output_dir)
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

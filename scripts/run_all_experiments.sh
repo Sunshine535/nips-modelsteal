@@ -68,7 +68,9 @@ run_timed() {
 
 log "Using $NUM_GPUS GPU(s). TORCHRUN: $TORCHRUN"
 
-# ── Step 1: KD Baseline (DDP across all GPUs) ───────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+#  Phase A: KD Baseline — torchrun DDP across ALL $NUM_GPUS GPUs
+# ═══════════════════════════════════════════════════════════════════════
 if [ "$SKIP_KD" = false ]; then
     run_timed "01_kd_baseline" \
         $TORCHRUN scripts/run_kd_baseline.py \
@@ -83,34 +85,76 @@ if [ "$SKIP_KD" = false ]; then
             --seed "$SEED"
 fi
 
-# ── Step 2: Progressive Inversion (strategies in parallel on separate GPUs) ──
+# ═══════════════════════════════════════════════════════════════════════
+#  Phase B: Inversion + Scaling + Defense — 8 parallel single-GPU tasks
+#   GPU 0-2: 3 inversion strategies
+#   GPU 3-6: 4 scaling budgets
+#   GPU 7:   defense evaluation
+# ═══════════════════════════════════════════════════════════════════════
+log "START: Phase B (inversion + scaling + defense, 8 parallel tasks on $NUM_GPUS GPUs)"
+GPU_IDX=0
+PIDS=()
+LABELS=()
+
+# --- 3 inversion strategies ---
 if [ "$SKIP_INVERSION" = false ]; then
-    log "START: 02_progressive_inversion (3 strategies in parallel)"
     STRATEGIES=(random gradient_magnitude fisher_information)
-    PIDS=()
-    for i in "${!STRATEGIES[@]}"; do
-        log "  GPU $i ← strategy=${STRATEGIES[$i]}"
-        CUDA_VISIBLE_DEVICES=$i python scripts/run_progressive_inversion.py \
+    for s in "${STRATEGIES[@]}"; do
+        log "  GPU $GPU_IDX ← strategy=$s"
+        CUDA_VISIBLE_DEVICES=$GPU_IDX python scripts/run_progressive_inversion.py \
             --config "$CONFIG" \
             --query_budget 500000 \
             --batch_size 64 \
             --learning_rate 1e-4 \
             --max_steps_per_layer 10000 \
             --query_pool_size 10000 \
-            --strategies "${STRATEGIES[$i]}" \
+            --strategies "$s" \
             --output_dir "$RESULTS_DIR/progressive_inversion" \
             --seed "$SEED" \
-            > "$LOG_DIR/02_strategy_${STRATEGIES[$i]}.log" 2>&1 &
-        PIDS+=($!)
+            > "$LOG_DIR/02_strategy_${s}.log" 2>&1 &
+        PIDS+=($!); LABELS+=("strategy_$s")
+        GPU_IDX=$((GPU_IDX + 1))
     done
+fi
 
-    FAIL=0
-    for j in "${!PIDS[@]}"; do
-        wait "${PIDS[$j]}" || { log "ERROR: strategy ${STRATEGIES[$j]} failed (pid=${PIDS[$j]})"; FAIL=1; }
-    done
-    if [ $FAIL -ne 0 ]; then exit 1; fi
+# --- 4 scaling budgets ---
+BUDGETS=(50000 100000 250000 500000)
+for b in "${BUDGETS[@]}"; do
+    log "  GPU $GPU_IDX ← scaling budget=$b"
+    CUDA_VISIBLE_DEVICES=$GPU_IDX python scripts/run_progressive_inversion.py \
+        --config "$CONFIG" \
+        --query_budget "$b" \
+        --strategies gradient_magnitude \
+        --output_dir "$RESULTS_DIR/scaling/budget_${b}" \
+        --seed "$SEED" \
+        > "$LOG_DIR/05_scaling_${b}.log" 2>&1 &
+    PIDS+=($!); LABELS+=("budget_$b")
+    GPU_IDX=$((GPU_IDX + 1))
+done
 
-    # Merge per-strategy summaries into combined comparison JSON
+# --- 1 defense evaluation ---
+if [ "$SKIP_DEFENSE" = false ]; then
+    log "  GPU $GPU_IDX ← defense eval (4 defenses)"
+    CUDA_VISIBLE_DEVICES=$GPU_IDX python scripts/run_defense_eval.py \
+        --config "$CONFIG" \
+        --query_budget 100000 \
+        --output_dir "$RESULTS_DIR/defense_eval" \
+        --defenses logit_rounding gaussian_noise temperature_perturbation watermarking \
+        --seed "$SEED" \
+        > "$LOG_DIR/04_defense_eval.log" 2>&1 &
+    PIDS+=($!); LABELS+=("defense_eval")
+    GPU_IDX=$((GPU_IDX + 1))
+fi
+
+# Wait for all Phase B tasks
+FAIL=0
+for j in "${!PIDS[@]}"; do
+    wait "${PIDS[$j]}" || { log "ERROR: ${LABELS[$j]} failed (pid=${PIDS[$j]})"; FAIL=1; }
+done
+if [ $FAIL -ne 0 ]; then exit 1; fi
+
+# Merge per-strategy summaries into combined comparison JSON
+if [ "$SKIP_INVERSION" = false ]; then
     python3 -c "
 import json; from pathlib import Path
 strats = ['random', 'gradient_magnitude', 'fisher_information']
@@ -128,12 +172,14 @@ for s in strats:
 (d / 'strategy_comparison.json').write_text(json.dumps(comp, indent=2))
 print('  Strategy comparison merged.')
 "
-    log "DONE:  02_progressive_inversion"
 fi
+log "DONE:  Phase B"
 
-# ── Step 3: Recovery Quality Evaluation ──────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+#  Phase C: Recovery Evaluation — torchrun DDP across ALL $NUM_GPUS GPUs
+# ═══════════════════════════════════════════════════════════════════════
 run_timed "03_eval_recovery" \
-    python scripts/eval_recovery_quality.py \
+    $TORCHRUN scripts/eval_recovery_quality.py \
         --config "$CONFIG" \
         --kd_model "$RESULTS_DIR/kd_baseline/best_student" \
         --inversion_model "$RESULTS_DIR/progressive_inversion/strategy_gradient_magnitude/recovered_model" \
@@ -141,44 +187,9 @@ run_timed "03_eval_recovery" \
         --num_output_samples 2000 \
         --downstream_samples 200
 
-# ── Step 4: Defense Evaluation ───────────────────────────────────────
-if [ "$SKIP_DEFENSE" = false ]; then
-    run_timed "04_defense_eval" \
-        python scripts/run_defense_eval.py \
-            --config "$CONFIG" \
-            --query_budget 100000 \
-            --output_dir "$RESULTS_DIR/defense_eval" \
-            --defenses logit_rounding gaussian_noise temperature_perturbation watermarking \
-            --seed "$SEED"
-fi
-
-# ── Step 5: Scaling Analysis (parallel budgets on separate GPUs) ──────
-log "START: 05_scaling_analysis (4 budgets in parallel)"
-BUDGETS=(50000 100000 250000 500000)
-PIDS=()
-for i in "${!BUDGETS[@]}"; do
-    log "  GPU $i ← budget=${BUDGETS[$i]}"
-    CUDA_VISIBLE_DEVICES=$i python scripts/run_progressive_inversion.py \
-        --config "$CONFIG" \
-        --query_budget "${BUDGETS[$i]}" \
-        --strategies gradient_magnitude \
-        --output_dir "$RESULTS_DIR/scaling/budget_${BUDGETS[$i]}" \
-        --seed "$SEED" \
-        > "$LOG_DIR/05_scaling_${BUDGETS[$i]}.log" 2>&1 &
-    PIDS+=($!)
-done
-
-FAIL=0
-for j in "${!PIDS[@]}"; do
-    wait "${PIDS[$j]}" || { log "ERROR: scaling budget=${BUDGETS[$j]} failed"; FAIL=1; }
-done
-if [ $FAIL -ne 0 ]; then exit 1; fi
-log "DONE:  05_scaling_analysis"
-
-# ── Step 6: Eval existing distillation baseline (reuse existing) ─────
 if [ -d "$RESULTS_DIR/distillation" ]; then
     run_timed "06_eval_distillation" \
-        python scripts/eval_recovery_quality.py \
+        $TORCHRUN scripts/eval_recovery_quality.py \
             --config "$CONFIG" \
             --kd_model "$RESULTS_DIR/distillation/best_student" \
             --inversion_model "$RESULTS_DIR/progressive_inversion/strategy_gradient_magnitude/recovered_model" \
