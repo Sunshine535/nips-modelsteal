@@ -140,8 +140,10 @@ setup_env() {
     export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
     export TRANSFORMERS_CACHE="${HF_HOME}/hub"
     export TOKENIZERS_PARALLELISM=false
-    export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
-    export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
+    export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+    export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+    export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-0}"
+    export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
     export CUDA_DEVICE_ORDER=PCI_BUS_ID
     export OMP_NUM_THREADS=8
 }

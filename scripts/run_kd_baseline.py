@@ -46,11 +46,19 @@ def setup_logging(rank: int = 0):
 
 def setup_distributed():
     if "RANK" in os.environ:
-        dist.init_process_group("nccl")
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
+        for backend in ("nccl", "gloo"):
+            try:
+                dist.init_process_group(backend)
+                logger.info("Distributed init OK: backend=%s", backend)
+                break
+            except Exception as e:
+                logger.warning("Backend %s failed: %s", backend, e)
+                if backend == "gloo":
+                    raise
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
         return rank, world_size, local_rank
     return 0, 1, 0
 
