@@ -238,7 +238,7 @@ def evaluate_gsm8k(model, tokenizer, device, max_samples=200, rank=0, world_size
     """Evaluate on GSM8K (math reasoning) — DDP-aware sample splitting."""
     try:
         from datasets import load_dataset
-        ds = load_dataset("openai/gsm8k", "main", split="test", trust_remote_code=True)
+        ds = load_dataset("openai/gsm8k", "main", split="test")
     except Exception as e:
         logger.warning("Could not load GSM8K: %s", e)
         return {"accuracy": -1, "note": str(e)}
@@ -288,7 +288,7 @@ def evaluate_mmlu(model, tokenizer, device, max_samples=200, rank=0, world_size=
     """Evaluate on MMLU (multiple choice) — DDP-aware sample splitting."""
     try:
         from datasets import load_dataset
-        ds = load_dataset("cais/mmlu", "all", split="test", trust_remote_code=True)
+        ds = load_dataset("cais/mmlu", "all", split="test")
     except Exception as e:
         logger.warning("Could not load MMLU: %s", e)
         return {"accuracy": -1, "note": str(e)}

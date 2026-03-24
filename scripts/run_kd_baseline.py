@@ -70,7 +70,7 @@ def build_query_dataset(tokenizer, num_queries: int, max_seq_len: int, seed: int
 
     try:
         from datasets import load_dataset
-        ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="train", trust_remote_code=True)
+        ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
         for example in ds:
             if len(input_ids_list) >= num_queries:
                 break

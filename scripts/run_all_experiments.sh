@@ -113,7 +113,7 @@ _ = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16, trust
 del _; torch.cuda.empty_cache()
 try:
     from datasets import load_dataset
-    _ = load_dataset('wikitext', 'wikitext-103-raw-v1', split='validation', trust_remote_code=True)
+    _ = load_dataset('wikitext', 'wikitext-103-raw-v1', split='validation')
     print('  Dataset cached.')
 except Exception as e:
     print(f'  Dataset cache failed (will use random pool): {e}')

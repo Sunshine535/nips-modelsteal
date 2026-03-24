@@ -125,15 +125,29 @@ class LayerWiseInverter:
         """
         Return layers in inversion order (output → input).
         For a transformer LM: lm_head → last decoder block → ... → first block.
+
+        Handles weight-tied models where lm_head.weight shares its tensor
+        with the embedding layer (the shared param only appears once in
+        named_parameters under the embedding name).
         """
         layers = []
 
+        lm_head_ptrs: set[int] = set()
+        for mod_name, module in self.student.named_modules():
+            if "lm_head" in mod_name:
+                for p in module.parameters():
+                    lm_head_ptrs.add(p.data_ptr())
+
         for name, param in self.student.named_parameters():
-            if "lm_head" in name:
+            if "lm_head" in name or param.data_ptr() in lm_head_ptrs:
                 layers.append((name, param))
+
+        added_ptrs = {p.data_ptr() for _, p in layers}
 
         block_params: dict[int, list] = {}
         for name, param in self.student.named_parameters():
+            if param.data_ptr() in added_ptrs:
+                continue
             if "layers." in name or "h." in name or "blocks." in name:
                 for part in name.split("."):
                     if part.isdigit():
@@ -141,13 +155,14 @@ class LayerWiseInverter:
                         if block_idx not in block_params:
                             block_params[block_idx] = []
                         block_params[block_idx].append((name, param))
+                        added_ptrs.add(param.data_ptr())
                         break
 
         for block_idx in sorted(block_params.keys(), reverse=True):
             layers.extend(block_params[block_idx])
 
         for name, param in self.student.named_parameters():
-            if "embed" in name and (name, param) not in layers:
+            if param.data_ptr() not in added_ptrs and "embed" in name:
                 layers.append((name, param))
 
         return layers
@@ -164,6 +179,18 @@ class LayerWiseInverter:
         Freezes all other parameters, optimizes target_params to minimize
         the difference between student and teacher logits.
         """
+        if not layer_names:
+            logger.info("No parameters to invert — returning empty result")
+            return LayerInversionResult(
+                layer_name="(empty)",
+                cosine_similarity=-1.0,
+                l2_distance=-1.0,
+                final_loss=0.0,
+                num_steps=0,
+                num_queries_used=0,
+                converged=True,
+            )
+
         for name, param in self.student.named_parameters():
             param.requires_grad = name in layer_names
 

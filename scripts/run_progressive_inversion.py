@@ -80,7 +80,7 @@ def build_query_pool(tokenizer, pool_size, max_seq_len, device, seed=42, dataset
             pool.build_from_dataset(dataset_cache, text_column="text")
         else:
             from datasets import load_dataset
-            ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="validation", trust_remote_code=True)
+            ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="validation")
             pool.build_from_dataset(ds, text_column="text")
     except Exception as e:
         logger.warning("Dataset load failed: %s. Using random pool.", e)
@@ -89,10 +89,23 @@ def build_query_pool(tokenizer, pool_size, max_seq_len, device, seed=42, dataset
 
 
 def classify_layers(student_model):
-    """Classify model parameters into inversion phases."""
+    """Classify model parameters into inversion phases.
+
+    Handles weight-tied models where lm_head.weight shares its tensor with
+    the embedding layer (tie_word_embeddings=True).  In that case
+    named_parameters() only lists the shared tensor once under the embedding
+    name, so a plain string match on "lm_head" finds nothing.  We detect
+    this by comparing data_ptr() of the lm_head module's weight.
+    """
     lm_head_params = []
     last_block_params = []
     deeper_params = []
+
+    lm_head_ptrs: set[int] = set()
+    for mod_name, module in student_model.named_modules():
+        if "lm_head" in mod_name:
+            for p in module.parameters():
+                lm_head_ptrs.add(p.data_ptr())
 
     max_block_idx = -1
     for name, _ in student_model.named_parameters():
@@ -102,13 +115,17 @@ def classify_layers(student_model):
                 break
 
     for name, param in student_model.named_parameters():
-        if "lm_head" in name:
+        if "lm_head" in name or param.data_ptr() in lm_head_ptrs:
             lm_head_params.append((name, param))
         elif any(part == str(max_block_idx) for part in name.split(".")):
             last_block_params.append((name, param))
         elif any(part.isdigit() for part in name.split(".")):
             deeper_params.append((name, param))
 
+    logger.info(
+        "Layer classification: lm_head=%d, last_block=%d, deeper=%d (max_block=%d)",
+        len(lm_head_params), len(last_block_params), len(deeper_params), max_block_idx,
+    )
     return lm_head_params, last_block_params, deeper_params, max_block_idx
 
 
@@ -180,6 +197,19 @@ def run_phase(
 ):
     """Run inversion for a single phase (group of parameters)."""
     logger.info("=== Phase: %s (%d parameter tensors) ===", phase_name, len(param_list))
+
+    if not param_list:
+        logger.info("  No parameters in this phase — skipping")
+        return {
+            "phase": phase_name,
+            "layer_result": {
+                "layer_name": "(empty)", "cosine_similarity": -1.0,
+                "l2_distance": -1.0, "final_loss": 0.0,
+                "num_steps": 0, "num_queries_used": 0, "converged": True,
+            },
+            "weight_metrics": {},
+            "total_params": 0,
+        }
 
     layer_names = [name for name, _ in param_list]
     target_params = [param for _, param in param_list]
@@ -418,7 +448,6 @@ def _run_main(args, rank, world_size, local_rank):
         from datasets import load_dataset
         args._dataset_cache = load_dataset(
             "wikitext", "wikitext-103-raw-v1", split="validation",
-            trust_remote_code=True,
         )
     except Exception as e:
         logger.warning("Dataset pre-load failed: %s (will use random pool)", e)

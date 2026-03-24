@@ -78,7 +78,7 @@ def build_query_dataset(
         from datasets import load_dataset
 
         logger.info("Loading dataset '%s' for query generation...", dataset_name)
-        ds = load_dataset(dataset_name, "wikitext-103-raw-v1", split="train", trust_remote_code=True)
+        ds = load_dataset(dataset_name, "wikitext-103-raw-v1", split="train")
 
         input_ids_list = []
         for example in ds:
