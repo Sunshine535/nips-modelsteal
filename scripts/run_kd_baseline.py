@@ -174,7 +174,7 @@ def train_kd_student(
         student_model.train()
         epoch_loss = 0.0
         num_batches = 0
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         for micro_step, (batch_ids, topk_probs, topk_indices) in enumerate(tqdm(
             loader, desc=f"KD Epoch {epoch+1}/{args.num_epochs}", disable=(rank != 0)
@@ -212,8 +212,9 @@ def train_kd_student(
                 torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                torch.cuda.empty_cache()
 
                 if rank == 0 and global_step % 100 == 0:
                     logger.info(
@@ -226,7 +227,7 @@ def train_kd_student(
             torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             global_step += 1
 
         avg_loss = epoch_loss / max(1, num_batches)
@@ -268,8 +269,8 @@ def parse_args():
     parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3.5-4B")
     parser.add_argument("--student_model", type=str, default="Qwen/Qwen3.5-4B")
     parser.add_argument("--query_budget", type=int, default=500000)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=2.0)
     parser.add_argument("--alpha", type=float, default=0.7,
                         help="Weight for KL loss vs CE loss")

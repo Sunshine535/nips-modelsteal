@@ -19,6 +19,7 @@ set -euo pipefail
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/gpu_utils.sh"
@@ -68,6 +69,27 @@ run_timed() {
 
 log "Using $NUM_GPUS GPU(s). TORCHRUN: $TORCHRUN"
 
+# Kill stale Python/torchrun processes on our GPUs from previous failed runs
+log "Checking for stale GPU processes..."
+STALE_PIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u || true)
+if [ -n "$STALE_PIDS" ]; then
+    log "WARNING: Found existing GPU processes: $STALE_PIDS"
+    log "  Attempting to clean up stale processes..."
+    for spid in $STALE_PIDS; do
+        CMDLINE=$(ps -p "$spid" -o comm= 2>/dev/null || true)
+        if [[ "$CMDLINE" == *python* ]] || [[ "$CMDLINE" == *torchrun* ]]; then
+            log "  Killing stale process $spid ($CMDLINE)"
+            kill -9 "$spid" 2>/dev/null || true
+        else
+            log "  Skipping non-Python process $spid ($CMDLINE)"
+        fi
+    done
+    sleep 3
+    log "GPU cleanup done"
+else
+    log "No stale GPU processes found"
+fi
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Phase A: KD Baseline — torchrun DDP across ALL $NUM_GPUS GPUs
 # ═══════════════════════════════════════════════════════════════════════
@@ -76,8 +98,8 @@ if [ "$SKIP_KD" = false ]; then
         $TORCHRUN scripts/run_kd_baseline.py \
             --config "$CONFIG" \
             --query_budget 500000 \
-            --batch_size 4 \
-            --gradient_accumulation_steps 8 \
+            --batch_size 2 \
+            --gradient_accumulation_steps 16 \
             --temperature 2.0 \
             --alpha 0.7 \
             --num_epochs 3 \
