@@ -140,15 +140,16 @@ def compute_phase_metrics(student_model, teacher_model, tokenizer, device, num_s
     total_match = 0
     total_kl = 0.0
     total_tokens = 0
-    seq_len = 128
-    batch_size = 16
+    seq_len = 64
+    batch_size = 4
 
     for _ in range(0, num_samples, batch_size):
         bsz = min(batch_size, num_samples)
         input_ids = torch.randint(3, vocab_size, (bsz, seq_len), generator=rng).to(device)
 
-        t_logits = teacher_model(input_ids).logits
-        s_logits = student_model(input_ids).logits
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            t_logits = teacher_model(input_ids).logits
+            s_logits = student_model(input_ids).logits
 
         total_match += (t_logits.argmax(-1) == s_logits.argmax(-1)).sum().item()
         kl = F.kl_div(
@@ -261,8 +262,9 @@ def run_full_inversion(
 
     student_model = AutoModelForCausalLM.from_pretrained(
         student_model_name, torch_dtype=torch.bfloat16,
-        device_map={"": device}, trust_remote_code=True,
+        device_map={"": device},
     )
+    student_model.gradient_checkpointing_enable()
     student_model.apply(lambda m: m.reset_parameters() if hasattr(m, "reset_parameters") else None)
 
     teacher = BlackBoxTeacher(model=teacher_model, device=device)
@@ -387,7 +389,7 @@ def parse_args():
     parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3.5-4B")
     parser.add_argument("--student_model", type=str, default="Qwen/Qwen3.5-4B")
     parser.add_argument("--query_budget", type=int, default=500000)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--max_steps_per_layer", type=int, default=10000)
     parser.add_argument("--query_pool_size", type=int, default=10000)
@@ -436,10 +438,11 @@ def _run_main(args, rank, world_size, local_rank):
     logger.info("Loading teacher model...")
     teacher_model = AutoModelForCausalLM.from_pretrained(
         args.teacher_model, torch_dtype=torch.bfloat16,
-        device_map={"": device}, trust_remote_code=True,
+        device_map={"": device},
     )
+    teacher_model.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 

@@ -157,7 +157,7 @@ if [ "$SKIP_INVERSION" = false ]; then
         CUDA_VISIBLE_DEVICES=$GPU_IDX python scripts/run_progressive_inversion.py \
             --config "$CONFIG" \
             --query_budget 500000 \
-            --batch_size 64 \
+            --batch_size 8 \
             --learning_rate 1e-4 \
             --max_steps_per_layer 10000 \
             --query_pool_size 10000 \
@@ -178,6 +178,7 @@ for b in "${BUDGETS[@]}"; do
     CUDA_VISIBLE_DEVICES=$GPU_IDX python scripts/run_progressive_inversion.py \
         --config "$CONFIG" \
         --query_budget "$b" \
+        --batch_size 8 \
         --strategies gradient_magnitude \
         --output_dir "$RESULTS_DIR/scaling/budget_${b}" \
         --seed "$SEED" \

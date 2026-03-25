@@ -84,7 +84,7 @@ class ActiveQuerySelector:
     def __init__(
         self,
         strategy: str = "gradient_magnitude",
-        selection_batch: int = 64,
+        selection_batch: int = 16,
         device: str = "cuda",
     ):
         self.strategy = strategy
@@ -145,8 +145,9 @@ class ActiveQuerySelector:
 
         for (batch_ids,) in loader:
             batch_ids = batch_ids.to(self.device)
-            student_logits = student_model(batch_ids).logits
-            teacher_logits = teacher_fn(batch_ids)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                student_logits = student_model(batch_ids).logits
+                teacher_logits = teacher_fn(batch_ids)
 
             divergence = F.kl_div(
                 F.log_softmax(student_logits, dim=-1),
@@ -183,12 +184,13 @@ class ActiveQuerySelector:
 
             for i in range(batch_ids.size(0)):
                 single_input = batch_ids[i : i + 1]
-                student_logits = student_model(single_input).logits
-                with torch.no_grad():
-                    teacher_logits = teacher_fn(single_input)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    student_logits = student_model(single_input).logits
+                    with torch.no_grad():
+                        teacher_logits = teacher_fn(single_input)
+                    loss = F.mse_loss(student_logits, teacher_logits)
 
-                loss = F.mse_loss(student_logits, teacher_logits)
-                student_model.zero_grad()
+                student_model.zero_grad(set_to_none=True)
                 loss.backward()
 
                 grad_norm = 0.0
@@ -198,7 +200,7 @@ class ActiveQuerySelector:
                 grad_norm = grad_norm ** 0.5
                 batch_scores.append(grad_norm)
 
-                student_model.zero_grad()
+                student_model.zero_grad(set_to_none=True)
 
             scores.extend(batch_scores)
 
@@ -228,7 +230,8 @@ class ActiveQuerySelector:
 
             for i in range(batch_ids.size(0)):
                 single_input = batch_ids[i : i + 1]
-                student_logits = student_model(single_input).logits
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    student_logits = student_model(single_input).logits
 
                 log_probs = F.log_softmax(student_logits, dim=-1)
                 sampled_tokens = torch.multinomial(
@@ -236,7 +239,7 @@ class ActiveQuerySelector:
                 )
                 nll = -log_probs[:, -1, :].gather(1, sampled_tokens).sum()
 
-                student_model.zero_grad()
+                student_model.zero_grad(set_to_none=True)
                 nll.backward()
 
                 fisher_trace = 0.0
@@ -245,7 +248,7 @@ class ActiveQuerySelector:
                         fisher_trace += (p.grad.data ** 2).sum().item()
 
                 batch_scores.append(fisher_trace)
-                student_model.zero_grad()
+                student_model.zero_grad(set_to_none=True)
 
             scores.extend(batch_scores)
 

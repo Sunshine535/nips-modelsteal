@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class InversionConfig:
     query_budget: int = 500000
-    batch_size: int = 64
+    batch_size: int = 8
     learning_rate: float = 1e-4
     weight_decay: float = 0.0
     max_steps_per_layer: int = 10000
@@ -33,7 +33,7 @@ class InversionConfig:
     regularization_type: str = "l2"
     active_query_strategy: str = "gradient_magnitude"
     active_query_pool_size: int = 10000
-    selection_batch: int = 64
+    selection_batch: int = 16
     log_every: int = 100
     save_every: int = 1000
     eval_every: int = 500
@@ -227,14 +227,15 @@ class LayerWiseInverter:
             teacher_logits = self.teacher.query(input_ids)
             total_queries += input_ids.size(0)
 
-            student_logits = self.student(input_ids).logits
-            loss = F.mse_loss(student_logits, teacher_logits)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                student_logits = self.student(input_ids).logits
+                loss = F.mse_loss(student_logits, teacher_logits)
 
-            if self.config.regularization_lambda > 0:
-                reg = self._compute_regularization(trainable)
-                loss = loss + self.config.regularization_lambda * reg
+                if self.config.regularization_lambda > 0:
+                    reg = self._compute_regularization(trainable)
+                    loss = loss + self.config.regularization_lambda * reg
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
             optimizer.step()

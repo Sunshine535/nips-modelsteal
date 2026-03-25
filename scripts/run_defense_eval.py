@@ -120,7 +120,7 @@ def measure_defense_utility(teacher_model, defense_fn, tokenizer, device, num_sa
     teacher_model.eval()
     vocab_size = tokenizer.vocab_size
     rng = torch.Generator().manual_seed(456)
-    batch_size, seq_len = 32, 128
+    batch_size, seq_len = 4, 64
 
     total_kl = 0.0
     total_top1_preserved = 0
@@ -130,7 +130,8 @@ def measure_defense_utility(teacher_model, defense_fn, tokenizer, device, num_sa
         bsz = min(batch_size, num_samples)
         input_ids = torch.randint(3, vocab_size, (bsz, seq_len), generator=rng).to(device)
 
-        clean_logits = teacher_model(input_ids).logits
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            clean_logits = teacher_model(input_ids).logits
         defended_logits = defense_fn(clean_logits) if defense_fn else clean_logits
 
         kl = F.kl_div(
@@ -144,6 +145,9 @@ def measure_defense_utility(teacher_model, defense_fn, tokenizer, device, num_sa
             clean_logits.argmax(-1) == defended_logits.argmax(-1)
         ).sum().item()
         total_tokens += bsz * seq_len
+
+        del clean_logits, defended_logits, input_ids
+    torch.cuda.empty_cache()
 
     return {
         "kl_divergence": total_kl / total_tokens,
@@ -162,20 +166,22 @@ def run_inversion_trial(
 
     student = AutoModelForCausalLM.from_pretrained(
         student_model_name, torch_dtype=torch.bfloat16,
-        device_map={"": device}, trust_remote_code=True,
+        device_map={"": device},
     )
+    student.gradient_checkpointing_enable()
     student.apply(lambda m: m.reset_parameters() if hasattr(m, "reset_parameters") else None)
 
-    pool = QueryPool(tokenizer, pool_size=5000, max_seq_len=256, device=device)
+    pool = QueryPool(tokenizer, pool_size=2000, max_seq_len=128, device=device)
     pool.build_random(tokenizer.vocab_size)
 
     inv_config = InversionConfig(
         query_budget=query_budget,
-        batch_size=32,
+        batch_size=4,
         learning_rate=1e-4,
         max_steps_per_layer=3000,
         convergence_threshold=1e-6,
         active_query_strategy="gradient_magnitude",
+        selection_batch=16,
     )
 
     inverter = LayerWiseInverter(student, teacher, inv_config, device)
@@ -338,10 +344,11 @@ def _run_main(args):
     logger.info("Loading teacher model...")
     teacher_raw = AutoModelForCausalLM.from_pretrained(
         args.teacher_model, torch_dtype=torch.bfloat16,
-        device_map={"": device}, trust_remote_code=True,
+        device_map={"": device},
     )
+    teacher_raw.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
