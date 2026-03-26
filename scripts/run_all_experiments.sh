@@ -71,10 +71,12 @@ log "Using $NUM_GPUS GPU(s). TORCHRUN: $TORCHRUN"
 
 # Kill stale Python/torchrun processes on our GPUs from previous failed runs
 log "Checking for stale GPU processes..."
-STALE_PIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u || true)
-if [ -n "$STALE_PIDS" ]; then
-    log "WARNING: Found existing GPU processes: $STALE_PIDS"
-    log "  Attempting to clean up stale processes..."
+for _attempt in 1 2; do
+    STALE_PIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u || true)
+    if [ -z "$STALE_PIDS" ]; then
+        break
+    fi
+    log "WARNING: Found GPU processes (attempt $_attempt): $STALE_PIDS"
     for spid in $STALE_PIDS; do
         CMDLINE=$(ps -p "$spid" -o comm= 2>/dev/null || true)
         if [[ "$CMDLINE" == *python* ]] || [[ "$CMDLINE" == *torchrun* ]]; then
@@ -84,10 +86,13 @@ if [ -n "$STALE_PIDS" ]; then
             log "  Skipping non-Python process $spid ($CMDLINE)"
         fi
     done
-    sleep 3
-    log "GPU cleanup done"
+    sleep 5
+done
+REMAINING=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | wc -l || echo 0)
+if [ "$REMAINING" -gt 0 ]; then
+    log "WARNING: $REMAINING GPU processes still alive — may cause OOM if on same GPUs"
 else
-    log "No stale GPU processes found"
+    log "All GPUs clean"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -66,7 +66,8 @@ def setup_distributed():
 def extract_ground_truth(model):
     gt = {}
     for name, param in model.named_parameters():
-        gt[name] = param.data.clone().cpu()
+        gt[name] = param.data.cpu().clone()
+    torch.cuda.empty_cache()
     return gt
 
 

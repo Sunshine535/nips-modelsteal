@@ -355,9 +355,10 @@ def _run_main(args):
         tokenizer.pad_token = tokenizer.eos_token
 
     ground_truth = {
-        name: param.data.clone().cpu()
+        name: param.data.cpu().clone()
         for name, param in teacher_raw.named_parameters()
     }
+    torch.cuda.empty_cache()
 
     # Run no-defense baseline
     logger.info("Running no-defense baseline...")
