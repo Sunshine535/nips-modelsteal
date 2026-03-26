@@ -85,10 +85,12 @@ class ActiveQuerySelector:
         self,
         strategy: str = "gradient_magnitude",
         selection_batch: int = 16,
+        candidate_pool_size: int = 256,
         device: str = "cuda",
     ):
         self.strategy = strategy
         self.selection_batch = selection_batch
+        self.candidate_pool_size = candidate_pool_size
         self.device = device
 
         self._strategies = {
@@ -166,7 +168,10 @@ class ActiveQuerySelector:
     ) -> torch.Tensor:
         """
         Select inputs that produce the largest gradient on target parameters.
-        Gradient magnitude indicates information content about unknown weights.
+
+        Uses per-sample MSE as a fast proxy for gradient magnitude: samples with
+        higher student-teacher divergence yield larger gradients. Only a random
+        subset of the pool (candidate_pool_size) is scored each call.
         """
         if target_params is None:
             logger.warning("No target_params; falling back to divergence selection")
@@ -174,87 +179,62 @@ class ActiveQuerySelector:
                 query_pool, student_model, teacher_fn, target_params, n_select
             )
 
+        n_candidates = min(self.candidate_pool_size, len(query_pool.pool))
+        candidate_indices = torch.randperm(len(query_pool.pool))[:n_candidates]
+        candidates = query_pool.pool[candidate_indices]
+
         scores = []
+        student_model.eval()
+        for start in range(0, n_candidates, self.selection_batch):
+            batch = candidates[start : start + self.selection_batch].to(self.device)
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                s_logits = student_model(batch).logits
+                t_logits = teacher_fn(batch)
+                per_sample = F.mse_loss(s_logits, t_logits, reduction="none")
+                per_sample = per_sample.mean(dim=(1, 2))
+            scores.append(per_sample.cpu())
         student_model.train()
-        loader = query_pool.get_dataloader(batch_size=self.selection_batch)
 
-        for (batch_ids,) in loader:
-            batch_ids = batch_ids.to(self.device)
-            batch_scores = []
-
-            for i in range(batch_ids.size(0)):
-                single_input = batch_ids[i : i + 1]
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    student_logits = student_model(single_input).logits
-                    with torch.no_grad():
-                        teacher_logits = teacher_fn(single_input)
-                    loss = F.mse_loss(student_logits, teacher_logits)
-
-                student_model.zero_grad(set_to_none=True)
-                loss.backward()
-
-                grad_norm = 0.0
-                for p in target_params:
-                    if p.grad is not None:
-                        grad_norm += p.grad.data.norm(2).item() ** 2
-                grad_norm = grad_norm ** 0.5
-                batch_scores.append(grad_norm)
-
-                student_model.zero_grad(set_to_none=True)
-
-            scores.extend(batch_scores)
-
-        scores = torch.tensor(scores)
-        _, top_indices = scores.topk(min(n_select, len(scores)))
-        return query_pool.pool[top_indices]
+        scores = torch.cat(scores)
+        _, top_idx = scores.topk(min(n_select, len(scores)))
+        return candidates[top_idx]
 
     def _select_fisher_information(
         self, query_pool, student_model, teacher_fn, target_params, n_select
     ) -> torch.Tensor:
         """
-        Select inputs that maximize the Fisher information trace for target params.
-        Approximated by the squared gradient (diagonal Fisher).
+        Select inputs that maximize Fisher information for target params.
+
+        Uses KL divergence between student and teacher as a fast proxy for
+        Fisher information. Only a random subset of the pool is scored.
         """
         if target_params is None:
             return self._select_divergence(
                 query_pool, student_model, teacher_fn, target_params, n_select
             )
 
+        n_candidates = min(self.candidate_pool_size, len(query_pool.pool))
+        candidate_indices = torch.randperm(len(query_pool.pool))[:n_candidates]
+        candidates = query_pool.pool[candidate_indices]
+
         scores = []
+        student_model.eval()
+        for start in range(0, n_candidates, self.selection_batch):
+            batch = candidates[start : start + self.selection_batch].to(self.device)
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                s_logits = student_model(batch).logits
+                t_logits = teacher_fn(batch)
+                kl = F.kl_div(
+                    F.log_softmax(s_logits, dim=-1),
+                    F.softmax(t_logits, dim=-1),
+                    reduction="none",
+                ).sum(dim=-1).mean(dim=-1)
+            scores.append(kl.cpu())
         student_model.train()
-        loader = query_pool.get_dataloader(batch_size=self.selection_batch)
 
-        for (batch_ids,) in loader:
-            batch_ids = batch_ids.to(self.device)
-            batch_scores = []
-
-            for i in range(batch_ids.size(0)):
-                single_input = batch_ids[i : i + 1]
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    student_logits = student_model(single_input).logits
-
-                log_probs = F.log_softmax(student_logits, dim=-1)
-                sampled_tokens = torch.multinomial(
-                    F.softmax(student_logits[:, -1, :], dim=-1), 1
-                )
-                nll = -log_probs[:, -1, :].gather(1, sampled_tokens).sum()
-
-                student_model.zero_grad(set_to_none=True)
-                nll.backward()
-
-                fisher_trace = 0.0
-                for p in target_params:
-                    if p.grad is not None:
-                        fisher_trace += (p.grad.data ** 2).sum().item()
-
-                batch_scores.append(fisher_trace)
-                student_model.zero_grad(set_to_none=True)
-
-            scores.extend(batch_scores)
-
-        scores = torch.tensor(scores)
-        _, top_indices = scores.topk(min(n_select, len(scores)))
-        return query_pool.pool[top_indices]
+        scores = torch.cat(scores)
+        _, top_idx = scores.topk(min(n_select, len(scores)))
+        return candidates[top_idx]
 
 
 def compute_query_information_gain(

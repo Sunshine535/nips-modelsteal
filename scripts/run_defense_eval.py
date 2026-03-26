@@ -165,11 +165,13 @@ def run_inversion_trial(
     teacher = BlackBoxTeacher(model=teacher_raw, device=device, defense_fn=defense_fn)
 
     student = AutoModelForCausalLM.from_pretrained(
-        student_model_name, torch_dtype=torch.bfloat16,
-        device_map={"": device},
+        student_model_name, dtype=torch.bfloat16,
+        device_map={"": device}, trust_remote_code=True,
     )
     student.gradient_checkpointing_enable()
-    student.apply(lambda m: m.reset_parameters() if hasattr(m, "reset_parameters") else None)
+    for m in student.modules():
+        if hasattr(m, "reset_parameters") and isinstance(m, (torch.nn.Linear, torch.nn.Embedding)):
+            m.reset_parameters()
 
     pool = QueryPool(tokenizer, pool_size=2000, max_seq_len=128, device=device)
     pool.build_random(tokenizer.vocab_size)
@@ -343,12 +345,12 @@ def _run_main(args):
 
     logger.info("Loading teacher model...")
     teacher_raw = AutoModelForCausalLM.from_pretrained(
-        args.teacher_model, torch_dtype=torch.bfloat16,
-        device_map={"": device},
+        args.teacher_model, dtype=torch.bfloat16,
+        device_map={"": device}, trust_remote_code=True,
     )
     teacher_raw.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model)
+    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 

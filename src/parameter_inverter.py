@@ -33,7 +33,9 @@ class InversionConfig:
     regularization_type: str = "l2"
     active_query_strategy: str = "gradient_magnitude"
     active_query_pool_size: int = 10000
+    candidate_pool_size: int = 256
     selection_batch: int = 16
+    selection_frequency: int = 10
     log_every: int = 100
     save_every: int = 1000
     eval_every: int = 500
@@ -112,6 +114,7 @@ class LayerWiseInverter:
         self.query_selector = ActiveQuerySelector(
             strategy=config.active_query_strategy,
             selection_batch=config.selection_batch,
+            candidate_pool_size=config.candidate_pool_size,
             device=device,
         )
 
@@ -202,28 +205,36 @@ class LayerWiseInverter:
             layer_names[:3],
         )
 
+        self.student.train()
         optimizer = self._build_optimizer(trainable)
         total_queries = 0
         best_loss = float("inf")
         steps_without_improvement = 0
+        cached_input_ids = None
 
         for step in range(self.config.max_steps_per_layer):
             if total_queries >= self.config.query_budget:
                 logger.info("Query budget exhausted at step %d", step)
                 break
 
-            if self.query_pool is not None and self.config.active_query_strategy != "random":
-                input_ids = self.query_selector.select(
-                    self.query_pool,
-                    self.student,
-                    self.teacher.query,
-                    target_params=trainable,
-                    n_select=self.config.batch_size,
-                )
-            else:
-                input_ids = self._get_random_batch()
+            need_reselect = (
+                cached_input_ids is None
+                or step % self.config.selection_frequency == 0
+            )
+            if need_reselect:
+                if self.query_pool is not None and self.config.active_query_strategy != "random":
+                    cached_input_ids = self.query_selector.select(
+                        self.query_pool,
+                        self.student,
+                        self.teacher.query,
+                        target_params=trainable,
+                        n_select=self.config.batch_size,
+                    )
+                    self.student.train()
+                else:
+                    cached_input_ids = self._get_random_batch()
 
-            input_ids = input_ids.to(self.device)
+            input_ids = cached_input_ids.to(self.device)
             teacher_logits = self.teacher.query(input_ids)
             total_queries += input_ids.size(0)
 
@@ -289,6 +300,7 @@ class LayerWiseInverter:
         output_dir: Optional[str] = None,
     ) -> InversionResult:
         """Run full progressive inversion pipeline."""
+        self.student.train()
         result = InversionResult()
         invertible = self.get_invertible_layers()
 

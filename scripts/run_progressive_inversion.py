@@ -261,11 +261,13 @@ def run_full_inversion(
     strategy_dir.mkdir(parents=True, exist_ok=True)
 
     student_model = AutoModelForCausalLM.from_pretrained(
-        student_model_name, torch_dtype=torch.bfloat16,
-        device_map={"": device},
+        student_model_name, dtype=torch.bfloat16,
+        device_map={"": device}, trust_remote_code=True,
     )
     student_model.gradient_checkpointing_enable()
-    student_model.apply(lambda m: m.reset_parameters() if hasattr(m, "reset_parameters") else None)
+    for m in student_model.modules():
+        if hasattr(m, "reset_parameters") and isinstance(m, (torch.nn.Linear, torch.nn.Embedding)):
+            m.reset_parameters()
 
     teacher = BlackBoxTeacher(model=teacher_model, device=device)
 
@@ -294,6 +296,7 @@ def run_full_inversion(
     total_queries = 0
 
     # Phase 1: lm_head
+    student_model.train()
     p1 = run_phase(
         "phase1_lm_head", lm_head_params, student_model, teacher,
         ground_truth, inv_config, query_pool, device, str(strategy_dir),
@@ -306,6 +309,7 @@ def run_full_inversion(
                 p1["layer_result"]["cosine_similarity"], p1_downstream["top1_match_rate"])
 
     # Phase 2: last transformer block
+    student_model.train()
     p2 = run_phase(
         "phase2_last_block", last_block_params, student_model, teacher,
         ground_truth, inv_config, query_pool, device, str(strategy_dir),
@@ -351,6 +355,7 @@ def run_full_inversion(
             seed=args.seed,
         )
 
+        student_model.train()
         block_result = run_phase(
             f"phase3_block_{block_idx}", block_groups[block_idx],
             student_model, teacher, ground_truth, block_config,
@@ -437,12 +442,12 @@ def _run_main(args, rank, world_size, local_rank):
 
     logger.info("Loading teacher model...")
     teacher_model = AutoModelForCausalLM.from_pretrained(
-        args.teacher_model, torch_dtype=torch.bfloat16,
-        device_map={"": device},
+        args.teacher_model, dtype=torch.bfloat16,
+        device_map={"": device}, trust_remote_code=True,
     )
     teacher_model.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model)
+    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
