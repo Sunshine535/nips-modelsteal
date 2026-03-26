@@ -441,7 +441,7 @@ def parse_args():
 
 def load_model(path, device):
     return AutoModelForCausalLM.from_pretrained(
-        path, dtype=torch.bfloat16, device_map={"": device}, trust_remote_code=True,
+        path, torch_dtype=torch.bfloat16, device_map={"": device}, trust_remote_code=True,
     )
 
 

@@ -165,7 +165,7 @@ def run_inversion_trial(
     teacher = BlackBoxTeacher(model=teacher_raw, device=device, defense_fn=defense_fn)
 
     student = AutoModelForCausalLM.from_pretrained(
-        student_model_name, dtype=torch.bfloat16,
+        student_model_name, torch_dtype=torch.bfloat16,
         device_map={"": device}, trust_remote_code=True,
     )
     student.gradient_checkpointing_enable()
@@ -345,7 +345,7 @@ def _run_main(args):
 
     logger.info("Loading teacher model...")
     teacher_raw = AutoModelForCausalLM.from_pretrained(
-        args.teacher_model, dtype=torch.bfloat16,
+        args.teacher_model, torch_dtype=torch.bfloat16,
         device_map={"": device}, trust_remote_code=True,
     )
     teacher_raw.eval()

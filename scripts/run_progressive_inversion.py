@@ -261,7 +261,7 @@ def run_full_inversion(
     strategy_dir.mkdir(parents=True, exist_ok=True)
 
     student_model = AutoModelForCausalLM.from_pretrained(
-        student_model_name, dtype=torch.bfloat16,
+        student_model_name, torch_dtype=torch.bfloat16,
         device_map={"": device}, trust_remote_code=True,
     )
     student_model.gradient_checkpointing_enable()
@@ -442,7 +442,7 @@ def _run_main(args, rank, world_size, local_rank):
 
     logger.info("Loading teacher model...")
     teacher_model = AutoModelForCausalLM.from_pretrained(
-        args.teacher_model, dtype=torch.bfloat16,
+        args.teacher_model, torch_dtype=torch.bfloat16,
         device_map={"": device}, trust_remote_code=True,
     )
     teacher_model.eval()

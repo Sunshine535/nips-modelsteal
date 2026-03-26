@@ -131,7 +131,7 @@ except Exception:
 name = name or 'Qwen/Qwen3.5-4B'
 print(f'  Warming cache for {name} ...')
 _ = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
-_ = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16, trust_remote_code=True)
+_ = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16, trust_remote_code=True)
 del _; torch.cuda.empty_cache()
 try:
     from datasets import load_dataset

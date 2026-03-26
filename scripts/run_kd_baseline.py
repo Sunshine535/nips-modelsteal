@@ -311,7 +311,7 @@ def main():
         num_queries = min(args.query_budget, args.query_budget // args.max_seq_len)
         logger.info("Loading teacher: %s", args.teacher_model)
         teacher_model = AutoModelForCausalLM.from_pretrained(
-            args.teacher_model, dtype=torch.bfloat16,
+            args.teacher_model, torch_dtype=torch.bfloat16,
             device_map={"": device}, trust_remote_code=True,
         )
         logger.info("Building query dataset (%d queries)...", num_queries)
@@ -334,7 +334,7 @@ def main():
 
     logger.info("Loading student: %s (random init)", args.student_model)
     student_model = AutoModelForCausalLM.from_pretrained(
-        args.student_model, dtype=torch.bfloat16, trust_remote_code=True,
+        args.student_model, torch_dtype=torch.bfloat16, trust_remote_code=True,
     )
     student_model.apply(lambda m: m.reset_parameters() if hasattr(m, "reset_parameters") else None)
 
