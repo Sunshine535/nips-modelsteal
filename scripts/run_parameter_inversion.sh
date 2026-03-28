@@ -8,7 +8,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 # Progressive Parameter Inversion — Full Pipeline Launcher (8x A100)
 
-export HF_ENDPOINT="https://hf-mirror.com"
+# HF_ENDPOINT removed (use default huggingface.co)
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export TRANSFORMERS_CACHE="$HF_HOME/hub"
 export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"

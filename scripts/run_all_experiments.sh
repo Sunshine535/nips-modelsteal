@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+# HF_ENDPOINT removed (use default huggingface.co)
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
