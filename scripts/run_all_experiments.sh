@@ -32,6 +32,17 @@ if [ -f "$PROJ_DIR_ROOT/.venv/bin/activate" ]; then
 fi
 export PATH="$HOME/.local/bin:$PATH"
 
+PHASE_MARKER_DIR="$PROJ_DIR_ROOT/results/.phase_markers"
+mkdir -p "$PHASE_MARKER_DIR"
+FORCE_RERUN="${FORCE_RERUN:-0}"
+
+phase_done() { touch "$PHASE_MARKER_DIR/phase_${1}.done"; echo "[PHASE $1] Completed at $(date)"; }
+is_phase_done() {
+    [[ "$FORCE_RERUN" == "1" ]] && return 1
+    [[ -f "$PHASE_MARKER_DIR/phase_${1}.done" ]] && echo "[PHASE $1] Already completed. Skipping. (FORCE_RERUN=1 to override)" && return 0
+    return 1
+}
+
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
@@ -98,6 +109,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════
 #  Phase A: KD Baseline — torchrun DDP across ALL $NUM_GPUS GPUs
 # ═══════════════════════════════════════════════════════════════════════
+if ! is_phase_done A; then
 if [ "$SKIP_KD" = false ]; then
     run_timed "01_kd_baseline" \
         $TORCHRUN scripts/run_kd_baseline.py \
@@ -111,6 +123,8 @@ if [ "$SKIP_KD" = false ]; then
             --output_dir "$RESULTS_DIR/kd_baseline" \
             --seed "$SEED"
 fi
+phase_done A
+fi
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Phase B: Inversion + Scaling + Defense — 8 parallel single-GPU tasks
@@ -118,6 +132,7 @@ fi
 #   GPU 3-6: 4 scaling budgets
 #   GPU 7:   defense evaluation
 # ═══════════════════════════════════════════════════════════════════════
+if ! is_phase_done B; then
 
 # Pre-warm: ensure model weights + dataset are cached before parallel launches
 log "Pre-warming HF model cache and dataset..."
@@ -253,10 +268,13 @@ print('  Strategy comparison merged.')
 "
 fi
 log "DONE:  Phase B"
+phase_done B
+fi
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Phase C: Recovery Evaluation — torchrun DDP across ALL $NUM_GPUS GPUs
 # ═══════════════════════════════════════════════════════════════════════
+if ! is_phase_done C; then
 run_timed "03_eval_recovery" \
     $TORCHRUN scripts/eval_recovery_quality.py \
         --config "$CONFIG" \
@@ -273,6 +291,8 @@ if [ -d "$RESULTS_DIR/distillation" ]; then
             --kd_model "$RESULTS_DIR/distillation/best_student" \
             --inversion_model "$RESULTS_DIR/progressive_inversion/strategy_gradient_magnitude/recovered_model" \
             --output_dir "$RESULTS_DIR/eval_distillation_vs_inversion"
+fi
+phase_done C
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────

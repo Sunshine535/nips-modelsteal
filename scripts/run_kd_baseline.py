@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import glob
 import json
 import logging
 import os
@@ -34,6 +35,29 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 logger = logging.getLogger(__name__)
+
+
+def save_training_checkpoint(path, model, optimizer, epoch, step, **extra):
+    model_sd = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+    torch.save({"epoch": epoch, "step": step,
+                "model_state_dict": model_sd,
+                "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
+                **extra}, path)
+
+
+def load_training_checkpoint(path, model, optimizer=None):
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    target = model.module if hasattr(model, "module") else model
+    target.load_state_dict(ckpt["model_state_dict"])
+    if optimizer and ckpt.get("optimizer_state_dict"):
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    return ckpt.get("epoch", 0), ckpt.get("step", 0)
+
+
+def find_latest_checkpoint(output_dir, pattern="checkpoint_*.pt"):
+    ckpts = sorted(glob.glob(os.path.join(output_dir, pattern)),
+                   key=os.path.getmtime)
+    return ckpts[-1] if ckpts else None
 
 
 def setup_logging(rank: int = 0):
@@ -127,6 +151,7 @@ def collect_teacher_logits(teacher_model, dataset, batch_size, device, temperatu
 
 def train_kd_student(
     student_model, train_dataset, args, rank=0, world_size=1, local_rank=0,
+    resume_from_checkpoint=False,
 ):
     """Train student via KL divergence distillation from sparse top-K teacher logits."""
     device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
@@ -167,8 +192,21 @@ def train_kd_student(
     best_loss = float("inf")
     global_step = 0
     metrics_log = []
+    start_epoch = 0
 
-    for epoch in range(args.num_epochs):
+    if resume_from_checkpoint:
+        ckpt_path = find_latest_checkpoint(str(output_dir), "checkpoint_epoch*.pt")
+        if ckpt_path:
+            logger.info("Resuming from %s", ckpt_path)
+            start_epoch, global_step = load_training_checkpoint(ckpt_path, student_model, optimizer)
+            ckpt_data = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            best_loss = ckpt_data.get("best_loss", float("inf"))
+            metrics_log = ckpt_data.get("metrics_log", [])
+            if ckpt_data.get("scheduler_state_dict"):
+                scheduler.load_state_dict(ckpt_data["scheduler_state_dict"])
+            logger.info("  Resuming from epoch %d, global_step %d", start_epoch, global_step)
+
+    for epoch in range(start_epoch, args.num_epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
         student_model.train()
@@ -245,6 +283,13 @@ def train_kd_student(
                 model_to_save.save_pretrained(output_dir / "best_student")
                 logger.info("Saved best student (loss=%.4f)", best_loss)
 
+            save_training_checkpoint(
+                str(output_dir / f"checkpoint_epoch{epoch + 1}.pt"),
+                student_model, optimizer, epoch + 1, global_step,
+                best_loss=best_loss, metrics_log=metrics_log,
+                scheduler_state_dict=scheduler.state_dict(),
+            )
+
     if rank == 0:
         model_to_save = student_model.module if hasattr(student_model, "module") else student_model
         model_to_save.save_pretrained(output_dir / "final_student")
@@ -282,6 +327,8 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="results/kd_baseline")
     parser.add_argument("--config", type=str, default="configs/inversion_config.yaml")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="'auto' to resume from latest checkpoint, or path")
     return parser.parse_args()
 
 
@@ -338,7 +385,8 @@ def main():
     )
     student_model.apply(lambda m: m.reset_parameters() if hasattr(m, "reset_parameters") else None)
 
-    train_kd_student(student_model, distill_dataset, args, rank, world_size, local_rank)
+    train_kd_student(student_model, distill_dataset, args, rank, world_size, local_rank,
+                     resume_from_checkpoint=bool(args.resume_from_checkpoint))
 
     if rank == 0:
         tokenizer.save_pretrained(Path(args.output_dir) / "best_student")
