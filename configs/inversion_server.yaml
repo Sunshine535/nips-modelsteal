@@ -1,0 +1,52 @@
+# S-PSI server config — adapted for szs_cpu/gpu cluster
+teacher:
+  model_name: "/data/szs/share/Qwen3.5-0.8B"
+  device: "cuda"
+  dtype: "bfloat16"
+  max_seq_len: 256
+
+student:
+  model_name: "/data/szs/share/Qwen3.5-0.8B"
+  device: "cuda"
+  dtype: "bfloat16"
+  max_seq_len: 256
+
+inversion:
+  query_budget: 500000
+  batch_size: 16
+  learning_rate: 1.0e-4
+  lm_head_lr: 1.0e-3
+  max_steps_per_block: 10000
+  lm_head_steps: 5000
+  convergence_threshold: 1.0e-7
+  patience: 500
+  alpha: 1.0
+  beta: 0.1
+  gamma: 1.0e-5
+  num_perturbation_positions: 4
+  num_replacement_tokens: 2
+  num_suffix_blocks: 2
+  num_inits: 5
+  regimes:
+    - "oracle"
+    - "pure_logits"
+  output_dir: "/data/szs/share/modelsteal/results/spsi"
+  seed: 42
+
+evaluation:
+  metrics:
+    - "per_matrix_cosine_similarity"
+    - "cross_init_variance"
+    - "output_agreement"
+  num_eval_samples: 2000
+  output_dir: "/data/szs/share/modelsteal/results/evaluation"
+
+hardware:
+  num_gpus: 4
+  gpu_type: "auto"
+  gradient_checkpointing: true
+
+logging:
+  level: "INFO"
+  log_dir: "/data/szs/share/modelsteal/logs"
+  save_every_n_steps: 2000
