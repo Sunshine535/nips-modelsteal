@@ -311,8 +311,8 @@ def train_kd_student(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Knowledge Distillation Baseline")
-    parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3.5-4B")
-    parser.add_argument("--student_model", type=str, default="Qwen/Qwen3.5-4B")
+    parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3.5-0.8B")
+    parser.add_argument("--student_model", type=str, default="Qwen/Qwen3.5-0.8B")
     parser.add_argument("--query_budget", type=int, default=500000)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=16)
@@ -355,7 +355,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     if rank == 0:
-        num_queries = min(args.query_budget, args.query_budget // args.max_seq_len)
+        num_queries = args.query_budget
         logger.info("Loading teacher: %s", args.teacher_model)
         teacher_model = AutoModelForCausalLM.from_pretrained(
             args.teacher_model, torch_dtype=torch.bfloat16,

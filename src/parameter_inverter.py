@@ -1,11 +1,19 @@
 """
-Core module for Progressive Layer-wise Parameter Inversion (PLPI).
+Sensitivity-Guided Progressive Suffix Inversion (S-PSI).
 
-Given black-box query access to a teacher model (logits only), iteratively
-recover the teacher's weight parameters layer by layer, starting from the
-output projection and working inward.
+Recovers transformer suffix parameters (lm_head + last K blocks) from
+black-box logit access.  Two regimes are supported:
+
+  - **Oracle-prefix**: teacher boundary states h_{i-1}^T(x) are injected,
+    isolating suffix identifiability.
+  - **Pure-logits**: student prefix is frozen random init — realistic attack.
+
+Core loss per block:
+  L = α·L_logit + β·L_sensitivity + γ·L_reg
+where L_sensitivity matches how logits respond to token perturbations.
 """
 
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,49 +23,62 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .active_query import ActiveQuerySelector, QueryPool
-
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class InversionConfig:
-    query_budget: int = 500000
-    batch_size: int = 8
+class SPSIConfig:
+    """Configuration for S-PSI inversion."""
+
+    query_budget: int = 500_000
+    batch_size: int = 16
     learning_rate: float = 1e-4
+    lm_head_lr: float = 1e-3
     weight_decay: float = 0.0
-    max_steps_per_layer: int = 10000
-    convergence_threshold: float = 1e-6
-    optimizer_type: str = "adam"
-    regularization_lambda: float = 1e-4
-    regularization_type: str = "l2"
-    active_query_strategy: str = "gradient_magnitude"
-    active_query_pool_size: int = 10000
-    candidate_pool_size: int = 256
-    selection_batch: int = 16
-    selection_frequency: int = 10
+    max_steps_per_block: int = 10_000
+    lm_head_steps: int = 5_000
+    convergence_threshold: float = 1e-7
+    patience: int = 500
+
+    alpha: float = 1.0
+    beta: float = 0.1
+    gamma: float = 1e-5
+
+    num_perturbation_positions: int = 4
+    num_replacement_tokens: int = 2
+    max_seq_len: int = 256
+
+    suffix_refine_enabled: bool = False
+    suffix_refine_interval: int = 2000
+    suffix_refine_steps: int = 200
+    suffix_refine_lr: float = 1e-5
+
     log_every: int = 100
-    save_every: int = 1000
-    eval_every: int = 500
+    save_every: int = 2000
     seed: int = 42
 
 
 @dataclass
-class LayerInversionResult:
-    layer_name: str
-    cosine_similarity: float
-    l2_distance: float
-    final_loss: float
-    num_steps: int
-    num_queries_used: int
-    converged: bool
+class BlockResult:
+    """Result from inverting a single block."""
+
+    block_name: str
+    per_matrix_cosine: dict = field(default_factory=dict)
+    mean_cosine: float = -1.0
+    final_loss: float = 0.0
+    num_steps: int = 0
+    num_queries: int = 0
+    converged: bool = False
 
 
 @dataclass
-class InversionResult:
-    layer_results: list = field(default_factory=list)
+class SPSIResult:
+    """Full S-PSI inversion result."""
+
+    regime: str = "oracle"
+    block_results: list = field(default_factory=list)
     total_queries: int = 0
-    recovered_state_dict: Optional[dict] = None
+    init_seed: int = 42
 
 
 class BlackBoxTeacher:
@@ -77,376 +98,594 @@ class BlackBoxTeacher:
 
     @torch.no_grad()
     def query(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Return logits only — black-box access."""
         input_ids = input_ids.to(self.device)
         logits = self.model(input_ids).logits
         self.query_count += input_ids.size(0)
-
         if self.defense_fn is not None:
             logits = self.defense_fn(logits)
-
         return logits
 
+    @torch.no_grad()
+    def get_boundary_state(
+        self, input_ids: torch.Tensor, layer_idx: int
+    ) -> torch.Tensor:
+        """Extract intermediate hidden state after block `layer_idx`."""
+        input_ids = input_ids.to(self.device)
+        outputs = self.model(
+            input_ids, output_hidden_states=True, return_dict=True
+        )
+        return outputs.hidden_states[layer_idx + 1].detach()
 
-class LayerWiseInverter:
-    """
-    Recovers teacher weight parameters one layer at a time.
 
-    Strategy:
-    1. Start from the output projection (lm_head) — easiest to invert
-       because it directly maps to observed logits.
-    2. Fix recovered layers, optimize the next deeper layer.
-    3. Use active query selection to maximize information gain per query.
+class TeacherCache:
+    """Pre-computed teacher logits and perturbation responses."""
+
+    def __init__(self, device: str = "cuda"):
+        self.device = device
+        self.clean_logits: Optional[torch.Tensor] = None
+        self.input_ids: Optional[torch.Tensor] = None
+        self.perturbed_input_ids: Optional[torch.Tensor] = None
+        self.perturbed_logits: Optional[torch.Tensor] = None
+        self.boundary_states: dict[int, torch.Tensor] = {}
+
+    def build(
+        self,
+        teacher: BlackBoxTeacher,
+        input_ids: torch.Tensor,
+        config: SPSIConfig,
+        cache_boundary_layers: Optional[list[int]] = None,
+    ) -> None:
+        """Pre-compute all teacher outputs for the query pool."""
+        logger.info("Building teacher cache for %d inputs...", len(input_ids))
+        self.input_ids = input_ids
+        vocab_size = teacher.model.config.vocab_size
+
+        clean_logits_list = []
+        for start in range(0, len(input_ids), 32):
+            batch = input_ids[start : start + 32]
+            logits = teacher.query(batch)
+            clean_logits_list.append(logits.cpu())
+        self.clean_logits = torch.cat(clean_logits_list)
+        logger.info("  Clean logits cached: %s", self.clean_logits.shape)
+
+        rng = torch.Generator().manual_seed(config.seed)
+        P = config.num_perturbation_positions
+        R = config.num_replacement_tokens
+        seq_len = input_ids.size(1)
+        n = len(input_ids)
+
+        top_tokens = torch.arange(3, 3 + 50)
+
+        all_perturbed = []
+        all_perturbed_logits = []
+
+        for i in range(0, n, 32):
+            batch = input_ids[i : min(i + 32, n)]
+            bsz = batch.size(0)
+
+            positions = torch.randint(
+                0, seq_len, (bsz, P), generator=rng
+            )
+            replacements = top_tokens[
+                torch.randint(0, 50, (bsz, P, R), generator=rng)
+            ]
+
+            batch_perturbed = []
+            for b in range(bsz):
+                for p_idx in range(P):
+                    pos = positions[b, p_idx].item()
+                    for r_idx in range(R):
+                        x_prime = batch[b].clone()
+                        x_prime[pos] = replacements[b, p_idx, r_idx]
+                        batch_perturbed.append(x_prime)
+
+            if batch_perturbed:
+                stacked = torch.stack(batch_perturbed)
+                all_perturbed.append(stacked)
+                for s in range(0, len(stacked), 32):
+                    chunk = stacked[s : s + 32]
+                    pl = teacher.query(chunk)
+                    all_perturbed_logits.append(pl.cpu())
+
+        self.perturbed_input_ids = torch.cat(all_perturbed)
+        self.perturbed_logits = torch.cat(all_perturbed_logits)
+        logger.info(
+            "  Perturbed logits cached: %s (P=%d, R=%d)",
+            self.perturbed_logits.shape, P, R,
+        )
+
+        if cache_boundary_layers:
+            for layer_idx in cache_boundary_layers:
+                states = []
+                for start in range(0, n, 32):
+                    batch = input_ids[start : start + 32]
+                    h = teacher.get_boundary_state(batch, layer_idx)
+                    states.append(h.cpu())
+                self.boundary_states[layer_idx] = torch.cat(states)
+                logger.info(
+                    "  Boundary state cached for layer %d: %s",
+                    layer_idx, self.boundary_states[layer_idx].shape,
+                )
+
+    def get_batch(
+        self,
+        indices: torch.Tensor,
+        config: SPSIConfig,
+    ) -> tuple:
+        """Return (input_ids, clean_logits, perturbed_input_ids, perturbed_logits)."""
+        bsz = len(indices)
+        P = config.num_perturbation_positions
+        R = config.num_replacement_tokens
+        pert_per_input = P * R
+
+        ids = self.input_ids[indices]
+        cl = self.clean_logits[indices]
+
+        pert_indices = []
+        for idx in indices:
+            base = idx.item() * pert_per_input
+            pert_indices.extend(range(base, base + pert_per_input))
+
+        if pert_indices and max(pert_indices) < len(self.perturbed_input_ids):
+            pi = self.perturbed_input_ids[pert_indices]
+            pl = self.perturbed_logits[pert_indices]
+        else:
+            pi = ids.repeat(pert_per_input, 1)
+            pl = cl.repeat(pert_per_input, 1, 1)
+
+        return ids, cl, pi, pl
+
+    def get_boundary_batch(
+        self, indices: torch.Tensor, layer_idx: int
+    ) -> Optional[torch.Tensor]:
+        if layer_idx in self.boundary_states:
+            return self.boundary_states[layer_idx][indices]
+        return None
+
+
+def get_num_blocks(model: nn.Module) -> int:
+    """Return the number of transformer blocks in the model."""
+    max_idx = -1
+    for name, _ in model.named_parameters():
+        for part in name.split("."):
+            if part.isdigit():
+                max_idx = max(max_idx, int(part))
+                break
+    return max_idx + 1
+
+
+def get_block_param_names(model: nn.Module, block_idx: int) -> list[str]:
+    """Return parameter names belonging to a specific block."""
+    names = []
+    target = str(block_idx)
+    for name, _ in model.named_parameters():
+        parts = name.split(".")
+        for p in parts:
+            if p == target:
+                names.append(name)
+                break
+    return names
+
+
+def get_lm_head_param_names(model: nn.Module) -> list[str]:
+    """Return lm_head parameter names, handling weight tying."""
+    names = []
+    lm_head_ptrs: set[int] = set()
+    for mod_name, module in model.named_modules():
+        if "lm_head" in mod_name:
+            for p in module.parameters():
+                lm_head_ptrs.add(p.data_ptr())
+
+    for name, param in model.named_parameters():
+        if "lm_head" in name or param.data_ptr() in lm_head_ptrs:
+            names.append(name)
+    return names
+
+
+def compute_per_matrix_cosine(
+    model: nn.Module,
+    ground_truth: dict[str, torch.Tensor],
+    param_names: list[str],
+) -> dict[str, float]:
+    """Compute cosine similarity per weight matrix."""
+    metrics = {}
+    for name in param_names:
+        if name not in ground_truth:
+            continue
+        for n, p in model.named_parameters():
+            if n == name:
+                gt = ground_truth[name].to(p.device).float().flatten()
+                pred = p.data.float().flatten()
+                if gt.shape != pred.shape:
+                    break
+                sim = F.cosine_similarity(
+                    pred.unsqueeze(0), gt.unsqueeze(0)
+                ).item()
+                short = name.split(".")[-1]
+                metrics[short] = sim
+                break
+    return metrics
+
+
+def _inject_boundary_state(
+    student: nn.Module,
+    boundary_state: torch.Tensor,
+    block_idx: int,
+) -> None:
+    """Register a forward hook that replaces block input with teacher boundary state.
+
+    The hook intercepts the forward pass of block `block_idx` and substitutes
+    the incoming hidden state with the teacher's cached boundary state.
     """
+    pass
+
+
+class _BoundaryInjectionHook:
+    """Context manager that injects teacher boundary states into a student block."""
 
     def __init__(
         self,
-        student_model: nn.Module,
-        teacher: BlackBoxTeacher,
-        config: InversionConfig,
-        device: str = "cuda",
+        student: nn.Module,
+        cache: "TeacherCache",
+        indices: torch.Tensor,
+        boundary_layer_idx: int,
     ):
-        self.student = student_model
-        self.teacher = teacher
-        self.config = config
-        self.device = device
+        self.student = student
+        self.cache = cache
+        self.indices = indices
+        self.boundary_layer_idx = boundary_layer_idx
+        self.hook = None
+        self._boundary = None
 
-        self.query_selector = ActiveQuerySelector(
-            strategy=config.active_query_strategy,
-            selection_batch=config.selection_batch,
-            candidate_pool_size=config.candidate_pool_size,
-            device=device,
-        )
+    def __enter__(self):
+        h = self.cache.get_boundary_batch(self.indices, self.boundary_layer_idx)
+        if h is None:
+            return self
+        device = next(self.student.parameters()).device
+        self._boundary = h.to(device)
 
-        self.query_pool: Optional[QueryPool] = None
-        self._recovered_layers: dict[str, torch.Tensor] = {}
+        block = _get_block_module(self.student, self.boundary_layer_idx + 1)
+        if block is not None:
+            def hook_fn(module, args):
+                if self._boundary is not None:
+                    if isinstance(args, tuple) and len(args) > 0:
+                        new_args = (self._boundary,) + args[1:]
+                        return new_args
+                return args
 
-    def set_query_pool(self, query_pool: QueryPool) -> None:
-        self.query_pool = query_pool
+            self.hook = block.register_forward_pre_hook(hook_fn)
+        return self
 
-    def get_invertible_layers(self) -> list[tuple[str, nn.Parameter]]:
-        """
-        Return layers in inversion order (output → input).
-        For a transformer LM: lm_head → last decoder block → ... → first block.
+    def __exit__(self, *args):
+        if self.hook is not None:
+            self.hook.remove()
+            self.hook = None
+        self._boundary = None
 
-        Handles weight-tied models where lm_head.weight shares its tensor
-        with the embedding layer (the shared param only appears once in
-        named_parameters under the embedding name).
-        """
-        layers = []
 
-        lm_head_ptrs: set[int] = set()
-        for mod_name, module in self.student.named_modules():
-            if "lm_head" in mod_name:
-                for p in module.parameters():
-                    lm_head_ptrs.add(p.data_ptr())
-
-        for name, param in self.student.named_parameters():
-            if "lm_head" in name or param.data_ptr() in lm_head_ptrs:
-                layers.append((name, param))
-
-        added_ptrs = {p.data_ptr() for _, p in layers}
-
-        block_params: dict[int, list] = {}
-        for name, param in self.student.named_parameters():
-            if param.data_ptr() in added_ptrs:
-                continue
-            if "layers." in name or "h." in name or "blocks." in name:
-                for part in name.split("."):
-                    if part.isdigit():
-                        block_idx = int(part)
-                        if block_idx not in block_params:
-                            block_params[block_idx] = []
-                        block_params[block_idx].append((name, param))
-                        added_ptrs.add(param.data_ptr())
-                        break
-
-        for block_idx in sorted(block_params.keys(), reverse=True):
-            layers.extend(block_params[block_idx])
-
-        for name, param in self.student.named_parameters():
-            if param.data_ptr() not in added_ptrs and "embed" in name:
-                layers.append((name, param))
-
-        return layers
-
-    def invert_layer(
-        self,
-        layer_names: list[str],
-        target_params: list[nn.Parameter],
-        teacher_ground_truth: Optional[dict] = None,
-    ) -> LayerInversionResult:
-        """
-        Invert a single layer (or group of related parameters).
-
-        Freezes all other parameters, optimizes target_params to minimize
-        the difference between student and teacher logits.
-        """
-        if not layer_names:
-            logger.info("No parameters to invert — returning empty result")
-            return LayerInversionResult(
-                layer_name="(empty)",
-                cosine_similarity=-1.0,
-                l2_distance=-1.0,
-                final_loss=0.0,
-                num_steps=0,
-                num_queries_used=0,
-                converged=True,
-            )
-
-        for name, param in self.student.named_parameters():
-            param.requires_grad = name in layer_names
-
-        trainable = [p for p in self.student.parameters() if p.requires_grad]
-        logger.info(
-            "Inverting %d parameters across %d tensors: %s",
-            sum(p.numel() for p in trainable),
-            len(trainable),
-            layer_names[:3],
-        )
-
-        self.student.train()
-        optimizer = self._build_optimizer(trainable)
-        total_queries = 0
-        best_loss = float("inf")
-        steps_without_improvement = 0
-        cached_input_ids = None
-
-        for step in range(self.config.max_steps_per_layer):
-            if total_queries >= self.config.query_budget:
-                logger.info("Query budget exhausted at step %d", step)
-                break
-
-            need_reselect = (
-                cached_input_ids is None
-                or step % self.config.selection_frequency == 0
-            )
-            if need_reselect:
-                if self.query_pool is not None and self.config.active_query_strategy != "random":
-                    cached_input_ids = self.query_selector.select(
-                        self.query_pool,
-                        self.student,
-                        self.teacher.query,
-                        target_params=trainable,
-                        n_select=self.config.batch_size,
-                    )
-                    self.student.train()
-                else:
-                    cached_input_ids = self._get_random_batch()
-
-            input_ids = cached_input_ids.to(self.device)
-            teacher_logits = self.teacher.query(input_ids)
-            total_queries += input_ids.size(0)
-
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                student_logits = self.student(input_ids).logits
-                loss = F.mse_loss(student_logits, teacher_logits)
-
-                if self.config.regularization_lambda > 0:
-                    reg = self._compute_regularization(trainable)
-                    loss = loss + self.config.regularization_lambda * reg
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
-            optimizer.step()
-
-            loss_val = loss.item()
-            if loss_val < best_loss - self.config.convergence_threshold:
-                best_loss = loss_val
-                steps_without_improvement = 0
-            else:
-                steps_without_improvement += 1
-
-            if step % self.config.log_every == 0:
-                cos_sim = -1.0
-                if teacher_ground_truth is not None:
-                    cos_sim = self._compute_layer_cosine_sim(
-                        layer_names, teacher_ground_truth
-                    )
-                logger.info(
-                    "Step %d | loss=%.6f | best=%.6f | cos_sim=%.4f | queries=%d",
-                    step, loss_val, best_loss, cos_sim, total_queries,
-                )
-
-            if steps_without_improvement > 500:
-                logger.info("Converged at step %d (500 steps without improvement)", step)
-                break
-
-        cos_sim = -1.0
-        l2_dist = -1.0
-        if teacher_ground_truth is not None:
-            cos_sim = self._compute_layer_cosine_sim(layer_names, teacher_ground_truth)
-            l2_dist = self._compute_layer_l2(layer_names, teacher_ground_truth)
-
-        for name in layer_names:
-            for n, p in self.student.named_parameters():
-                if n == name:
-                    self._recovered_layers[name] = p.data.clone()
-
-        return LayerInversionResult(
-            layer_name=",".join(layer_names[:3]),
-            cosine_similarity=cos_sim,
-            l2_distance=l2_dist,
-            final_loss=best_loss,
-            num_steps=step + 1,
-            num_queries_used=total_queries,
-            converged=steps_without_improvement > 500,
-        )
-
-    def run_progressive_inversion(
-        self,
-        teacher_ground_truth: Optional[dict] = None,
-        output_dir: Optional[str] = None,
-    ) -> InversionResult:
-        """Run full progressive inversion pipeline."""
-        self.student.train()
-        result = InversionResult()
-        invertible = self.get_invertible_layers()
-
-        current_block = None
-        block_names = []
-        block_params = []
-
-        def _flush_block():
-            nonlocal block_names, block_params
-            if not block_names:
-                return
-            layer_result = self.invert_layer(
-                block_names, block_params, teacher_ground_truth
-            )
-            result.layer_results.append(layer_result)
-            result.total_queries += layer_result.num_queries_used
-            logger.info(
-                "Layer %s: cos_sim=%.4f, loss=%.6f, queries=%d",
-                layer_result.layer_name,
-                layer_result.cosine_similarity,
-                layer_result.final_loss,
-                layer_result.num_queries_used,
-            )
-            block_names = []
-            block_params = []
-
-        for name, param in invertible:
-            block_id = self._get_block_id(name)
-            if block_id != current_block:
-                _flush_block()
-                current_block = block_id
-
-            block_names.append(name)
-            block_params.append(param)
-
-        _flush_block()
-
-        result.recovered_state_dict = {
-            k: v.cpu() for k, v in self._recovered_layers.items()
-        }
-
-        if output_dir is not None:
-            self._save_results(result, output_dir)
-
-        return result
-
-    def _build_optimizer(self, params: list) -> torch.optim.Optimizer:
-        if self.config.optimizer_type == "adam":
-            return torch.optim.Adam(
-                params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-            )
-        elif self.config.optimizer_type == "sgd":
-            return torch.optim.SGD(
-                params,
-                lr=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-                momentum=0.9,
-            )
-        elif self.config.optimizer_type == "lbfgs":
-            return torch.optim.LBFGS(params, lr=self.config.learning_rate)
-        else:
-            raise ValueError(f"Unknown optimizer: {self.config.optimizer_type}")
-
-    def _compute_regularization(self, params: list) -> torch.Tensor:
-        reg = torch.tensor(0.0, device=self.device)
-        if self.config.regularization_type == "l2":
-            for p in params:
-                reg = reg + p.norm(2) ** 2
-        elif self.config.regularization_type == "l1":
-            for p in params:
-                reg = reg + p.norm(1)
-        return reg
-
-    def _compute_layer_cosine_sim(
-        self, layer_names: list[str], ground_truth: dict
-    ) -> float:
-        sims = []
-        for name in layer_names:
-            if name not in ground_truth:
-                continue
-            for n, p in self.student.named_parameters():
-                if n == name:
-                    gt = ground_truth[name].to(p.device).flatten().float()
-                    pred = p.data.flatten().float()
-                    sim = F.cosine_similarity(pred.unsqueeze(0), gt.unsqueeze(0)).item()
-                    sims.append(sim)
-                    break
-        return sum(sims) / len(sims) if sims else -1.0
-
-    def _compute_layer_l2(
-        self, layer_names: list[str], ground_truth: dict
-    ) -> float:
-        dists = []
-        for name in layer_names:
-            if name not in ground_truth:
-                continue
-            for n, p in self.student.named_parameters():
-                if n == name:
-                    gt = ground_truth[name].to(p.device).float()
-                    pred = p.data.float()
-                    dists.append((pred - gt).norm(2).item())
-                    break
-        return sum(dists) / len(dists) if dists else -1.0
-
-    @staticmethod
-    def _get_block_id(name: str) -> str:
+def _get_block_module(model: nn.Module, block_idx: int) -> Optional[nn.Module]:
+    """Get the module corresponding to a specific block index."""
+    for name, module in model.named_modules():
         parts = name.split(".")
-        for i, part in enumerate(parts):
-            if part.isdigit() and i > 0:
-                return ".".join(parts[: i + 1])
-        if "lm_head" in name:
-            return "lm_head"
-        if "embed" in name:
-            return "embed"
-        return name
+        if len(parts) >= 2 and parts[-1] == str(block_idx):
+            return module
+    return None
 
-    def _get_random_batch(self) -> torch.Tensor:
-        vocab_size = self.student.config.vocab_size
-        return torch.randint(3, vocab_size, (self.config.batch_size, 128))
 
-    def _save_results(self, result: InversionResult, output_dir: str) -> None:
-        out = Path(output_dir)
-        out.mkdir(parents=True, exist_ok=True)
+def invert_block(
+    student: nn.Module,
+    cache: TeacherCache,
+    config: SPSIConfig,
+    param_names: list[str],
+    ground_truth: Optional[dict] = None,
+    boundary_layer_idx: Optional[int] = None,
+    is_lm_head: bool = False,
+    checkpoint_dir: Optional[str] = None,
+    use_oracle_boundary: bool = False,
+    query_budget_remaining: Optional[int] = None,
+) -> BlockResult:
+    """Run S-PSI inversion for a single block (or lm_head).
 
-        if result.recovered_state_dict:
-            torch.save(result.recovered_state_dict, out / "recovered_weights.pt")
+    Args:
+        use_oracle_boundary: If True and boundary_layer_idx is set, inject
+            cached teacher boundary states as block input.
+        query_budget_remaining: If set, stop when budget is exhausted.
+    """
+    block_label = "lm_head" if is_lm_head else f"block_{boundary_layer_idx}"
+    lr = config.lm_head_lr if is_lm_head else config.learning_rate
+    max_steps = config.lm_head_steps if is_lm_head else config.max_steps_per_block
 
-        import json
-        summary = {
-            "total_queries": result.total_queries,
-            "layers": [
-                {
-                    "name": lr.layer_name,
-                    "cosine_similarity": lr.cosine_similarity,
-                    "l2_distance": lr.l2_distance,
-                    "final_loss": lr.final_loss,
-                    "num_steps": lr.num_steps,
-                    "num_queries_used": lr.num_queries_used,
-                    "converged": lr.converged,
-                }
-                for lr in result.layer_results
-            ],
-        }
-        with open(out / "inversion_summary.json", "w") as f:
-            json.dump(summary, f, indent=2)
+    for name, param in student.named_parameters():
+        param.requires_grad = name in param_names
 
-        logger.info("Saved inversion results to %s", out)
+    trainable = [p for p in student.parameters() if p.requires_grad]
+    total_params = sum(p.numel() for p in trainable)
+    logger.info(
+        "Inverting %s: %d params across %d tensors (oracle=%s)",
+        block_label, total_params, len(trainable), use_oracle_boundary,
+    )
+
+    optimizer = torch.optim.Adam(trainable, lr=lr, weight_decay=config.weight_decay)
+    device = next(student.parameters()).device
+    n_pool = len(cache.input_ids)
+    rng = torch.Generator().manual_seed(config.seed + hash(block_label) % 10000)
+
+    best_loss = float("inf")
+    no_improve = 0
+    total_queries = 0
+    start_step = 0
+
+    if checkpoint_dir:
+        import glob
+        ckpt_pattern = str(Path(checkpoint_dir) / f"ckpt_{block_label}_step*.pt")
+        existing = sorted(glob.glob(ckpt_pattern), key=lambda x: int(x.split("step")[-1].split(".")[0]))
+        if existing:
+            ckpt = torch.load(existing[-1], map_location=device, weights_only=False)
+            target = student.module if hasattr(student, "module") else student
+            target.load_state_dict(ckpt["model_state_dict"])
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            start_step = ckpt.get("step", 0)
+            best_loss = ckpt.get("best_loss", float("inf"))
+            logger.info(
+                "Resumed %s from step %d (best_loss=%.6f)",
+                block_label, start_step, best_loss,
+            )
+
+    P = config.num_perturbation_positions
+    R = config.num_replacement_tokens
+    pert_per_input = P * R
+
+    oracle_boundary = (
+        use_oracle_boundary
+        and boundary_layer_idx is not None
+        and not is_lm_head
+        and boundary_layer_idx in cache.boundary_states
+    )
+
+    for step in range(start_step, max_steps):
+        if query_budget_remaining is not None and total_queries >= query_budget_remaining:
+            logger.info("%s: query budget exhausted at step %d", block_label, step)
+            break
+
+        indices = torch.randint(0, n_pool, (config.batch_size,), generator=rng)
+        input_ids, clean_logits_t, pert_ids, pert_logits_t = cache.get_batch(
+            indices, config
+        )
+        input_ids = input_ids.to(device)
+        clean_logits_t = clean_logits_t.to(device)
+        pert_ids = pert_ids.to(device)
+        pert_logits_t = pert_logits_t.to(device)
+
+        student.train()
+
+        from contextlib import nullcontext
+
+        if oracle_boundary:
+            boundary_idx = boundary_layer_idx - 1
+            ctx_clean = _BoundaryInjectionHook(
+                student, cache, indices, boundary_idx,
+            )
+        else:
+            ctx_clean = nullcontext()
+
+        with ctx_clean:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                z_s = student(input_ids).logits
+                loss_logit = F.mse_loss(z_s.float(), clean_logits_t.float())
+
+        loss_sensitivity = torch.tensor(0.0, device=device)
+        if config.beta > 0 and len(pert_ids) > 0:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                z_s_pert = student(pert_ids).logits
+            delta_s = z_s_pert.float() - z_s.detach().float().repeat_interleave(
+                pert_per_input, dim=0
+            )
+            delta_t = pert_logits_t.float() - clean_logits_t.float().repeat_interleave(
+                pert_per_input, dim=0
+            )
+            loss_sensitivity = F.mse_loss(delta_s, delta_t)
+
+        with torch.no_grad():
+            loss_reg = sum(p.float().norm(2) ** 2 for p in trainable)
+
+        loss = (
+            config.alpha * loss_logit
+            + config.beta * loss_sensitivity
+            + config.gamma * loss_reg
+        )
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+        optimizer.step()
+
+        total_queries += config.batch_size * (1 + pert_per_input)
+        loss_val = loss.item()
+
+        if loss_val < best_loss - config.convergence_threshold:
+            best_loss = loss_val
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        if step % config.log_every == 0:
+            cos_str = ""
+            if ground_truth is not None:
+                pm = compute_per_matrix_cosine(student, ground_truth, param_names)
+                mean_cos = sum(pm.values()) / max(len(pm), 1)
+                cos_str = f" | mean_cos={mean_cos:.4f}"
+            logger.info(
+                "%s step %d/%d | loss=%.6f (logit=%.6f sens=%.6f) | best=%.6f | queries=%d%s",
+                block_label, step, max_steps,
+                loss_val, loss_logit.item(), loss_sensitivity.item(),
+                best_loss, total_queries, cos_str,
+            )
+
+        if no_improve >= config.patience:
+            logger.info(
+                "%s converged at step %d (%d steps without improvement)",
+                block_label, step, config.patience,
+            )
+            break
+
+        if checkpoint_dir and step > 0 and step % config.save_every == 0:
+            _save_checkpoint(
+                checkpoint_dir, block_label, step, student, optimizer, best_loss
+            )
+
+    per_matrix = {}
+    mean_cos = -1.0
+    if ground_truth is not None:
+        per_matrix = compute_per_matrix_cosine(student, ground_truth, param_names)
+        mean_cos = sum(per_matrix.values()) / max(len(per_matrix), 1)
+
+    return BlockResult(
+        block_name=block_label,
+        per_matrix_cosine=per_matrix,
+        mean_cosine=mean_cos,
+        final_loss=best_loss,
+        num_steps=step + 1,
+        num_queries=total_queries,
+        converged=no_improve >= config.patience,
+    )
+
+
+def run_spsi(
+    student: nn.Module,
+    teacher: BlackBoxTeacher,
+    cache: TeacherCache,
+    config: SPSIConfig,
+    regime: str = "oracle",
+    num_suffix_blocks: int = 2,
+    ground_truth: Optional[dict] = None,
+    output_dir: Optional[str] = None,
+    init_seed: int = 42,
+) -> SPSIResult:
+    """Run complete S-PSI pipeline."""
+    result = SPSIResult(regime=regime, init_seed=init_seed)
+    num_blocks = get_num_blocks(student)
+    ckpt_dir = str(Path(output_dir) / "checkpoints") if output_dir else None
+    use_oracle = regime == "oracle"
+    precompute_queries = teacher.query_count
+    budget_remaining = config.query_budget - precompute_queries
+    logger.info(
+        "Pre-compute used %d queries, remaining budget: %d",
+        precompute_queries, budget_remaining,
+    )
+
+    lm_head_names = get_lm_head_param_names(student)
+    logger.info("Phase 0: lm_head recovery (%d params)", len(lm_head_names))
+    lm_result = invert_block(
+        student, cache, config, lm_head_names,
+        ground_truth=ground_truth,
+        is_lm_head=True,
+        checkpoint_dir=ckpt_dir,
+        use_oracle_boundary=False,
+        query_budget_remaining=budget_remaining,
+    )
+    result.block_results.append(lm_result)
+    result.total_queries += lm_result.num_queries
+    budget_remaining -= lm_result.num_queries
+    logger.info(
+        "lm_head: mean_cos=%.4f, loss=%.6f, steps=%d, queries=%d (remaining=%d)",
+        lm_result.mean_cosine, lm_result.final_loss, lm_result.num_steps,
+        lm_result.num_queries, max(budget_remaining, 0),
+    )
+
+    for k in range(num_suffix_blocks):
+        block_idx = num_blocks - 1 - k
+        if block_idx < 0:
+            break
+        if budget_remaining <= 0:
+            logger.info("Query budget exhausted, stopping at block %d", block_idx)
+            break
+
+        block_names = get_block_param_names(student, block_idx)
+        if not block_names:
+            continue
+
+        logger.info(
+            "Phase %d: Block %d recovery (%d params, oracle=%s)",
+            k + 1, block_idx, len(block_names), use_oracle,
+        )
+        br = invert_block(
+            student, cache, config, block_names,
+            ground_truth=ground_truth,
+            boundary_layer_idx=block_idx,
+            checkpoint_dir=ckpt_dir,
+            use_oracle_boundary=use_oracle,
+            query_budget_remaining=budget_remaining,
+        )
+        result.block_results.append(br)
+        result.total_queries += br.num_queries
+        budget_remaining -= br.num_queries
+        logger.info(
+            "Block %d: mean_cos=%.4f, loss=%.6f, steps=%d, queries=%d (remaining=%d)",
+            block_idx, br.mean_cosine, br.final_loss, br.num_steps,
+            br.num_queries, max(budget_remaining, 0),
+        )
+
+    if output_dir:
+        _save_results(result, output_dir, student=student)
+
+    return result
+
+
+def _save_checkpoint(
+    ckpt_dir: str,
+    block_label: str,
+    step: int,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    best_loss: float,
+) -> None:
+    path = Path(ckpt_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "block": block_label,
+            "step": step,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_loss": best_loss,
+        },
+        path / f"ckpt_{block_label}_step{step}.pt",
+    )
+
+
+def _save_results(
+    result: SPSIResult,
+    output_dir: str,
+    student: Optional[nn.Module] = None,
+) -> None:
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    summary = {
+        "regime": result.regime,
+        "init_seed": result.init_seed,
+        "total_queries": result.total_queries,
+        "blocks": [
+            {
+                "name": br.block_name,
+                "per_matrix_cosine": br.per_matrix_cosine,
+                "mean_cosine": br.mean_cosine,
+                "final_loss": br.final_loss,
+                "num_steps": br.num_steps,
+                "num_queries": br.num_queries,
+                "converged": br.converged,
+            }
+            for br in result.block_results
+        ],
+    }
+
+    with open(out / "spsi_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+
+    if student is not None:
+        model_dir = out / "recovered_model"
+        model_to_save = student.module if hasattr(student, "module") else student
+        model_to_save.save_pretrained(str(model_dir))
+        logger.info("Recovered model saved to %s", model_dir)
+
+    logger.info("S-PSI results saved to %s", out)

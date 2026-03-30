@@ -1,22 +1,20 @@
 #!/usr/bin/env bash
-# Master experiment script for Progressive Parameter Inversion.
+# S-PSI: Master experiment script.
 #
 # Pipeline:
-#   1. KD baseline (teacher → student via logit distillation)
-#   2. Progressive inversion with 3 query strategies
-#   3. Recovery quality evaluation (weight + output + downstream)
-#   4. Defense evaluation (rounding, noise, temperature, watermark)
-#   5. Scaling analysis (vary query budget)
-#   6. Generate figures
+#   Phase A: KD Baseline (DDP)
+#   Phase B: S-PSI inversion — oracle + pure_logits (parallel per-init)
+#   Phase C: Ablation — β=0 (no sensitivity matching)
+#   Phase D: Depth boundary analysis — vary num_suffix_blocks
+#   Phase E: Recovery evaluation
 #
 # Usage:
 #   bash scripts/run_all_experiments.sh
-#   bash scripts/run_all_experiments.sh --skip_kd        # resume from inversion
+#   bash scripts/run_all_experiments.sh --skip_kd
 #   bash scripts/run_all_experiments.sh --gpus 4
 
 set -euo pipefail
 
-# HF_ENDPOINT removed (use default huggingface.co)
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -25,7 +23,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/gpu_utils.sh"
 auto_setup
 
-# --- Activate project venv (created by setup.sh) ---
 PROJ_DIR_ROOT="$(dirname "$SCRIPT_DIR")"
 if [ -f "$PROJ_DIR_ROOT/.venv/bin/activate" ]; then
     source "$PROJ_DIR_ROOT/.venv/bin/activate"
@@ -51,17 +48,19 @@ RESULTS_DIR="results"
 LOG_DIR="logs"
 SEED=42
 SKIP_KD=false
-SKIP_INVERSION=false
-SKIP_DEFENSE=false
+SKIP_ABLATION=false
+NUM_INITS=5
+NUM_SUFFIX=2
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --skip_kd)          SKIP_KD=true; shift ;;
-        --skip_inversion)   SKIP_INVERSION=true; shift ;;
-        --skip_defense)     SKIP_DEFENSE=true; shift ;;
-        --gpus)             export NUM_GPUS="$2"; shift 2 ;;
-        --seed)             SEED="$2"; shift 2 ;;
-        *)                  echo "WARNING: Unknown arg: $1 (ignored)"; shift ;;
+        --skip_kd)       SKIP_KD=true; shift ;;
+        --skip_ablation) SKIP_ABLATION=true; shift ;;
+        --gpus)          export NUM_GPUS="$2"; shift 2 ;;
+        --seed)          SEED="$2"; shift 2 ;;
+        --num_inits)     NUM_INITS="$2"; shift 2 ;;
+        --num_suffix)    NUM_SUFFIX="$2"; shift 2 ;;
+        *)               echo "WARNING: Unknown arg: $1 (ignored)"; shift ;;
     esac
 done
 
@@ -78,36 +77,28 @@ run_timed() {
     log "DONE:  $name (${elapsed}s)"
 }
 
+log "=== S-PSI Experiment Pipeline ==="
 log "Using $NUM_GPUS GPU(s). TORCHRUN: $TORCHRUN"
+log "Inits: $NUM_INITS | Suffix blocks: $NUM_SUFFIX | Seed: $SEED"
 
-# Kill stale Python/torchrun processes on our GPUs from previous failed runs
+# Kill stale GPU processes
 log "Checking for stale GPU processes..."
 for _attempt in 1 2; do
     STALE_PIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u || true)
-    if [ -z "$STALE_PIDS" ]; then
-        break
-    fi
+    if [ -z "$STALE_PIDS" ]; then break; fi
     log "WARNING: Found GPU processes (attempt $_attempt): $STALE_PIDS"
     for spid in $STALE_PIDS; do
         CMDLINE=$(ps -p "$spid" -o comm= 2>/dev/null || true)
         if [[ "$CMDLINE" == *python* ]] || [[ "$CMDLINE" == *torchrun* ]]; then
             log "  Killing stale process $spid ($CMDLINE)"
             kill -9 "$spid" 2>/dev/null || true
-        else
-            log "  Skipping non-Python process $spid ($CMDLINE)"
         fi
     done
     sleep 5
 done
-REMAINING=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | wc -l || echo 0)
-if [ "$REMAINING" -gt 0 ]; then
-    log "WARNING: $REMAINING GPU processes still alive — may cause OOM if on same GPUs"
-else
-    log "All GPUs clean"
-fi
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Phase A: KD Baseline — torchrun DDP across ALL $NUM_GPUS GPUs
+#  Phase A: KD Baseline
 # ═══════════════════════════════════════════════════════════════════════
 if ! is_phase_done A; then
 if [ "$SKIP_KD" = false ]; then
@@ -117,8 +108,6 @@ if [ "$SKIP_KD" = false ]; then
             --query_budget 500000 \
             --batch_size 2 \
             --gradient_accumulation_steps 16 \
-            --temperature 2.0 \
-            --alpha 0.7 \
             --num_epochs 3 \
             --output_dir "$RESULTS_DIR/kd_baseline" \
             --seed "$SEED"
@@ -127,199 +116,130 @@ phase_done A
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Phase B: Inversion + Scaling + Defense — 8 parallel single-GPU tasks
-#   GPU 0-2: 3 inversion strategies
-#   GPU 3-6: 4 scaling budgets
-#   GPU 7:   defense evaluation
+#  Phase B: S-PSI Oracle-Prefix
 # ═══════════════════════════════════════════════════════════════════════
 if ! is_phase_done B; then
-
-# Pre-warm: ensure model weights + dataset are cached before parallel launches
-log "Pre-warming HF model cache and dataset..."
-python3 -c "
-import torch, os, warnings; warnings.filterwarnings('ignore')
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-from transformers import AutoModelForCausalLM, AutoTokenizer
-name = None
-try:
-    import yaml
-    with open('$CONFIG') as f:
-        c = yaml.safe_load(f)
-    name = c.get('teacher', {}).get('model_name')
-except Exception:
-    pass
-name = name or 'Qwen/Qwen3.5-4B'
-print(f'  Warming cache for {name} ...')
-_ = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
-_ = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16, trust_remote_code=True)
-del _; torch.cuda.empty_cache()
-try:
-    from datasets import load_dataset
-    _ = load_dataset('wikitext', 'wikitext-103-raw-v1', split='validation')
-    print('  Dataset cached.')
-except Exception as e:
-    print(f'  Dataset cache failed (will use random pool): {e}')
-print('  Cache warm-up done.')
-" 2>&1 | tee "$LOG_DIR/00_cache_warmup.log"
-log "Cache warm-up complete"
-
-STAGGER_SECS="${STAGGER_SECS:-5}"
-log "START: Phase B (inversion + scaling + defense, 8 parallel tasks on $NUM_GPUS GPUs, stagger=${STAGGER_SECS}s)"
-GPU_IDX=0
-PIDS=()
-LABELS=()
-
-# --- 3 inversion strategies ---
-if [ "$SKIP_INVERSION" = false ]; then
-    STRATEGIES=(random gradient_magnitude fisher_information)
-    for s in "${STRATEGIES[@]}"; do
-        log "  GPU $GPU_IDX ← strategy=$s"
-        CUDA_VISIBLE_DEVICES=$GPU_IDX python scripts/run_progressive_inversion.py \
+    run_timed "02_spsi_oracle" \
+        python scripts/run_spsi.py \
             --config "$CONFIG" \
-            --query_budget 500000 \
-            --batch_size 8 \
-            --learning_rate 1e-4 \
-            --max_steps_per_layer 10000 \
-            --query_pool_size 10000 \
-            --strategies "$s" \
-            --output_dir "$RESULTS_DIR/progressive_inversion" \
-            --seed "$SEED" \
-            > "$LOG_DIR/02_strategy_${s}.log" 2>&1 &
-        PIDS+=($!); LABELS+=("strategy_$s")
-        GPU_IDX=$((GPU_IDX + 1))
-        sleep "$STAGGER_SECS"
-    done
-fi
-
-# --- 4 scaling budgets ---
-BUDGETS=(50000 100000 250000 500000)
-for b in "${BUDGETS[@]}"; do
-    log "  GPU $GPU_IDX ← scaling budget=$b"
-    CUDA_VISIBLE_DEVICES=$GPU_IDX python scripts/run_progressive_inversion.py \
-        --config "$CONFIG" \
-        --query_budget "$b" \
-        --batch_size 8 \
-        --strategies gradient_magnitude \
-        --output_dir "$RESULTS_DIR/scaling/budget_${b}" \
-        --seed "$SEED" \
-        > "$LOG_DIR/05_scaling_${b}.log" 2>&1 &
-    PIDS+=($!); LABELS+=("budget_$b")
-    GPU_IDX=$((GPU_IDX + 1))
-    sleep "$STAGGER_SECS"
-done
-
-# --- 1 defense evaluation ---
-if [ "$SKIP_DEFENSE" = false ]; then
-    log "  GPU $GPU_IDX ← defense eval (4 defenses)"
-    CUDA_VISIBLE_DEVICES=$GPU_IDX python scripts/run_defense_eval.py \
-        --config "$CONFIG" \
-        --query_budget 100000 \
-        --output_dir "$RESULTS_DIR/defense_eval" \
-        --defenses logit_rounding gaussian_noise temperature_perturbation watermarking \
-        --seed "$SEED" \
-        > "$LOG_DIR/04_defense_eval.log" 2>&1 &
-    PIDS+=($!); LABELS+=("defense_eval")
-    GPU_IDX=$((GPU_IDX + 1))
-fi
-
-# Wait for all Phase B tasks
-FAIL=0
-FAIL_LABELS=()
-for j in "${!PIDS[@]}"; do
-    if ! wait "${PIDS[$j]}"; then
-        log "ERROR: ${LABELS[$j]} failed (pid=${PIDS[$j]})"
-        log "  Log: $LOG_DIR (check the corresponding .log file for traceback)"
-        FAIL=1
-        FAIL_LABELS+=("${LABELS[$j]}")
-    fi
-done
-if [ $FAIL -ne 0 ]; then
-    log "Phase B failures: ${FAIL_LABELS[*]}"
-    log "Dumping last 30 lines of each failed log:"
-    for fl in "${FAIL_LABELS[@]}"; do
-        for logf in "$LOG_DIR"/02_strategy_*.log "$LOG_DIR"/05_scaling_*.log "$LOG_DIR"/04_defense_eval.log; do
-            if [[ "$logf" == *"$fl"* ]] || [[ "$fl" == *"$(basename "$logf" .log | sed 's/^[0-9]*_//')"* ]]; then
-                log "--- $logf (last 30 lines) ---"
-                tail -30 "$logf" 2>/dev/null || true
-            fi
-        done
-    done
-    exit 1
-fi
-
-# Merge per-strategy summaries into combined comparison JSON
-if [ "$SKIP_INVERSION" = false ]; then
-    python3 -c "
-import json; from pathlib import Path
-strats = ['random', 'gradient_magnitude', 'fisher_information']
-d = Path('$RESULTS_DIR/progressive_inversion')
-comp = {'strategies': {}, 'query_budget': 500000}
-for s in strats:
-    p = d / f'strategy_{s}' / 'inversion_summary.json'
-    if p.exists():
-        r = json.loads(p.read_text())
-        comp['strategies'][s] = dict(
-            total_queries=r['total_queries'],
-            final_top1_match=r['final_downstream']['top1_match_rate'],
-            final_kl_divergence=r['final_downstream']['mean_kl_divergence'],
-            num_phases=len(r['phases']))
-(d / 'strategy_comparison.json').write_text(json.dumps(comp, indent=2))
-print('  Strategy comparison merged.')
-"
-fi
-log "DONE:  Phase B"
-phase_done B
+            --regime oracle \
+            --num_inits "$NUM_INITS" \
+            --num_suffix_blocks "$NUM_SUFFIX" \
+            --output_dir "$RESULTS_DIR/spsi_oracle" \
+            --seed "$SEED"
+    phase_done B
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Phase C: Recovery Evaluation — torchrun DDP across ALL $NUM_GPUS GPUs
+#  Phase C: S-PSI Pure-Logits
 # ═══════════════════════════════════════════════════════════════════════
 if ! is_phase_done C; then
-run_timed "03_eval_recovery" \
-    $TORCHRUN scripts/eval_recovery_quality.py \
-        --config "$CONFIG" \
-        --kd_model "$RESULTS_DIR/kd_baseline/best_student" \
-        --inversion_model "$RESULTS_DIR/progressive_inversion/strategy_gradient_magnitude/recovered_model" \
-        --output_dir "$RESULTS_DIR/recovery_evaluation" \
-        --num_output_samples 2000 \
-        --downstream_samples 200
+    run_timed "03_spsi_pure_logits" \
+        python scripts/run_spsi.py \
+            --config "$CONFIG" \
+            --regime pure_logits \
+            --num_inits "$NUM_INITS" \
+            --num_suffix_blocks "$NUM_SUFFIX" \
+            --output_dir "$RESULTS_DIR/spsi_pure_logits" \
+            --seed "$SEED"
+    phase_done C
+fi
 
-if [ -d "$RESULTS_DIR/distillation" ]; then
-    run_timed "06_eval_distillation" \
+# ═══════════════════════════════════════════════════════════════════════
+#  Phase D: Ablation — β=0 (no sensitivity matching)
+# ═══════════════════════════════════════════════════════════════════════
+if ! is_phase_done D; then
+if [ "$SKIP_ABLATION" = false ]; then
+    run_timed "04_ablation_beta0" \
+        python scripts/run_spsi.py \
+            --config "$CONFIG" \
+            --regime both \
+            --beta 0.0 \
+            --num_inits "$NUM_INITS" \
+            --num_suffix_blocks "$NUM_SUFFIX" \
+            --output_dir "$RESULTS_DIR/spsi_ablation_beta0" \
+            --seed "$SEED"
+fi
+phase_done D
+fi
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Phase D2: Wrong-Teacher Falsification Control
+# ═══════════════════════════════════════════════════════════════════════
+if ! is_phase_done D2; then
+    run_timed "04b_wrong_teacher" \
+        python scripts/run_spsi.py \
+            --config "$CONFIG" \
+            --regime oracle \
+            --num_inits 3 \
+            --num_suffix_blocks "$NUM_SUFFIX" \
+            --wrong_teacher \
+            --output_dir "$RESULTS_DIR/spsi_wrong_teacher" \
+            --seed "$SEED"
+    phase_done D2
+fi
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Phase E: Depth Boundary Analysis
+# ═══════════════════════════════════════════════════════════════════════
+if ! is_phase_done E; then
+    DEPTH_VALS=(1 2 4 6)
+    for d in "${DEPTH_VALS[@]}"; do
+        run_timed "05_depth_${d}" \
+            python scripts/run_spsi.py \
+                --config "$CONFIG" \
+                --regime oracle \
+                --num_inits 3 \
+                --num_suffix_blocks "$d" \
+                --max_steps 5000 \
+                --output_dir "$RESULTS_DIR/spsi_depth/depth_${d}" \
+                --seed "$SEED"
+    done
+    phase_done E
+fi
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Phase F: Recovery Evaluation
+# ═══════════════════════════════════════════════════════════════════════
+if ! is_phase_done F; then
+    if [ -d "$RESULTS_DIR/kd_baseline/best_student" ]; then
+        KD_MODEL="$RESULTS_DIR/kd_baseline/best_student"
+    else
+        KD_MODEL="$RESULTS_DIR/kd_baseline/final_student"
+    fi
+    INV_MODEL="$RESULTS_DIR/spsi_oracle/regime_oracle/init_0/recovered_model"
+
+    run_timed "06_eval_recovery" \
         $TORCHRUN scripts/eval_recovery_quality.py \
             --config "$CONFIG" \
-            --kd_model "$RESULTS_DIR/distillation/best_student" \
-            --inversion_model "$RESULTS_DIR/progressive_inversion/strategy_gradient_magnitude/recovered_model" \
-            --output_dir "$RESULTS_DIR/eval_distillation_vs_inversion"
-fi
-phase_done C
+            --kd_model "$KD_MODEL" \
+            --inversion_model "$INV_MODEL" \
+            --output_dir "$RESULTS_DIR/recovery_evaluation" \
+            --num_output_samples 2000 \
+            --downstream_samples 200
+    phase_done F
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────
 log "============================================="
-log "All experiments complete."
+log "S-PSI: All experiments complete."
 log "Results directory: $RESULTS_DIR"
 log "Logs directory:    $LOG_DIR"
 log ""
 log "Key outputs:"
 log "  KD baseline:       $RESULTS_DIR/kd_baseline/"
-log "  Progressive inv:   $RESULTS_DIR/progressive_inversion/"
+log "  S-PSI Oracle:      $RESULTS_DIR/spsi_oracle/"
+log "  S-PSI Pure-Logits: $RESULTS_DIR/spsi_pure_logits/"
+log "  Ablation β=0:      $RESULTS_DIR/spsi_ablation_beta0/"
+log "  Depth analysis:    $RESULTS_DIR/spsi_depth/"
 log "  Recovery eval:     $RESULTS_DIR/recovery_evaluation/"
-log "  Defense eval:      $RESULTS_DIR/defense_eval/"
-log "  Scaling analysis:  $RESULTS_DIR/scaling/"
-log ""
-log "Key JSON files:"
-log "  $RESULTS_DIR/progressive_inversion/strategy_comparison.json"
-log "  $RESULTS_DIR/recovery_evaluation/recovery_evaluation.json"
-log "  $RESULTS_DIR/defense_eval/defense_impact.json"
 log "============================================="
 
-# --- Pipeline completion marker ---
-DONE_FILE="$(dirname "$(dirname "${BASH_SOURCE[0]}")")/results/.pipeline_done"
+DONE_FILE="$PROJ_DIR_ROOT/results/.pipeline_done"
 mkdir -p "$(dirname "$DONE_FILE")"
 cat > "$DONE_FILE" << DONEEOF
 {
-  "project": "$(basename "$(dirname "$(dirname "${BASH_SOURCE[0]}")")")",
+  "project": "S-PSI",
   "completed_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
   "hostname": "$(hostname)",
   "gpus": "${NUM_GPUS:-unknown}",
@@ -327,6 +247,4 @@ cat > "$DONE_FILE" << DONEEOF
 }
 DONEEOF
 echo ""
-echo "[PIPELINE_COMPLETE] All experiments finished successfully."
-echo "  Marker: $DONE_FILE"
-echo "  Run 'bash collect_results.sh' to package results."
+echo "[PIPELINE_COMPLETE] S-PSI experiments finished successfully."

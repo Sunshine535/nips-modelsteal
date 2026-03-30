@@ -1,105 +1,67 @@
-# Progressive Parameter Inversion — Configuration
+# S-PSI: Sensitivity-Guided Progressive Suffix Inversion — Configuration
 
-# === Model Paths ===
-# Teacher and student MUST share the same architecture (hidden_size, num_layers, num_heads, etc.).
-# Layer-wise weight recovery compares/optimizes per-tensor shapes that only align when architectures match;
-# e.g. 9B vs 0.8B is invalid for parameter recovery (no weight correspondence).
-# Here both use Qwen3.5-4B to stay within a practical memory budget vs dual 9B. In the full paper
-# experiment, treat the student as a second instance of the same architecture initialized from random
-# weights or a different checkpoint—not a smaller Qwen variant.
+# Teacher and student MUST share the same architecture.
 teacher:
-  model_name: "Qwen/Qwen3.5-4B"
+  model_name: "Qwen/Qwen3.5-0.8B"
   device: "cuda"
   dtype: "bfloat16"
-  max_seq_len: 2048
+  max_seq_len: 256
 
 student:
-  model_name: "Qwen/Qwen3.5-4B"
+  model_name: "Qwen/Qwen3.5-0.8B"
   device: "cuda"
   dtype: "bfloat16"
-  max_seq_len: 2048
+  max_seq_len: 256
 
-# === Stage 1: Distillation ===
-distillation:
-  num_queries: 100000
-  batch_size: 32
-  temperature: 2.0
-  learning_rate: 5.0e-5
-  weight_decay: 0.01
-  num_epochs: 3
-  warmup_ratio: 0.05
-  output_dir: "results/distillation"
-  seed: 42
-  max_seq_len: 512
-  dataset: "wikitext"
-  dataset_split: "train"
-
-# === Stage 2: Layer-wise Inversion ===
+# === S-PSI Inversion ===
 inversion:
   query_budget: 500000
-  batch_size: 64
-  optimizer: "adam"
+  batch_size: 16
   learning_rate: 1.0e-4
-  weight_decay: 0.0
-  max_steps_per_layer: 10000
-  convergence_threshold: 1.0e-6
-  output_dir: "results/inversion"
+  lm_head_lr: 1.0e-3
+  max_steps_per_block: 10000
+  lm_head_steps: 5000
+  convergence_threshold: 1.0e-7
+  patience: 500
+
+  # Sensitivity matching
+  alpha: 1.0
+  beta: 0.1
+  gamma: 1.0e-5
+  num_perturbation_positions: 4
+  num_replacement_tokens: 2
+
+  # Suffix blocks to recover (from output)
+  num_suffix_blocks: 2
+
+  # Number of random initializations for identifiability
+  num_inits: 5
+
+  # Regimes to run
+  regimes:
+    - "oracle"
+    - "pure_logits"
+
+  output_dir: "results/spsi"
   seed: 42
 
-  layer_order: "output_first"
-  # Layers to invert (output_first = lm_head → last block → ... → first block)
-
-  regularization:
-    type: "l2"
-    lambda: 1.0e-4
-
-  active_queries:
-    enabled: true
-    strategy: "gradient_magnitude"
-    # Options: random, gradient_magnitude, fisher_information
-    pool_size: 10000
-    selection_batch: 64
-
-# === Stage 3: Evaluation ===
+# === Evaluation ===
 evaluation:
   metrics:
-    - "cosine_similarity"
-    - "l2_distance"
-    - "output_match_rate"
-    - "kl_divergence"
-  num_eval_samples: 5000
-  eval_batch_size: 32
+    - "per_matrix_cosine_similarity"
+    - "cross_init_variance"
+    - "output_agreement"
+  num_eval_samples: 2000
   output_dir: "results/evaluation"
-  downstream_tasks:
-    - "hellaswag"
-    - "arc_easy"
-    - "winogrande"
-
-# === Stage 4: Defense Evaluation ===
-defense:
-  defenses:
-    - type: "logit_rounding"
-      decimal_places: [2, 4, 6]
-    - type: "gaussian_noise"
-      sigma: [0.01, 0.1, 1.0]
-    - type: "temperature_perturbation"
-      delta: [0.1, 0.3, 0.5]
-    - type: "topk_masking"
-      k: [50, 100, 1000]
-    - type: "watermarking"
-      green_ratio: 0.5
-  output_dir: "results/defense"
 
 # === Hardware ===
 hardware:
   num_gpus: 8
   gpu_type: "A100-80GB"
-  distributed: true
   gradient_checkpointing: true
 
 # === Logging ===
 logging:
   level: "INFO"
   log_dir: "logs"
-  save_every_n_steps: 1000
-  eval_every_n_steps: 500
+  save_every_n_steps: 2000

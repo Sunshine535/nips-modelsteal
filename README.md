@@ -1,4 +1,7 @@
-# Progressive Parameter Inversion: Recovering LLM Weights from Black-Box Access
+# S-PSI: How Identifiable Are Transformer Weights from Logits?
+
+**Sensitivity-Guided Progressive Suffix Inversion** — recovering transformer
+suffix parameters from black-box logit access with identifiability analysis.
 
 ---
 
@@ -12,115 +15,124 @@ cd nips-modelsteal
 # 2. Install dependencies
 bash setup.sh
 
-# 3. Run all experiments
-bash run.sh
+# 3. Run S-PSI (oracle-prefix, 5 random inits, last 2 blocks)
+python scripts/run_spsi.py \
+    --model_name Qwen/Qwen3.5-0.8B \
+    --regime oracle \
+    --num_inits 5 \
+    --num_suffix_blocks 2 \
+    --output_dir results/spsi_oracle
 
-# 4. (Optional) Run in background for long experiments
-nohup bash run.sh > run.log 2>&1 &
-tail -f run.log
+# 4. Run S-PSI (pure-logits regime)
+python scripts/run_spsi.py \
+    --regime pure_logits \
+    --num_inits 5 \
+    --output_dir results/spsi_pure_logits
+
+# 5. Multi-GPU parallel (one init per GPU)
+bash scripts/run_spsi_multigpu.sh --regime oracle --num_inits 8 --gpus 4
+
+# 6. Full pipeline (all experiments)
+bash scripts/run_all_experiments.sh --gpus 4
+
+# 7. Wrong-teacher falsification
+python scripts/run_spsi.py --regime oracle --wrong_teacher --output_dir results/spsi_wrong_teacher
 ```
 
-### Check Completion
+### Ablation: Sensitivity Matching
 
 ```bash
-cat results/.pipeline_done   # Shows PIPELINE_COMPLETE when all phases finish
-ls results/.phase_markers/   # See which individual phases completed
+# β=0 (no sensitivity matching)
+python scripts/run_spsi.py --beta 0.0 --output_dir results/spsi_ablation_beta0
 ```
-
-### Save and Send Results
-
-```bash
-# Option A: Push to GitHub
-git add results/ logs/
-git commit -m "Experiment results"
-git push origin main
-
-# Option B: Package as tarball
-bash collect_results.sh
-# Output: results_archive/nips-modelsteal_results_YYYYMMDD_HHMMSS.tar.gz
-```
-
-### Resume After Interruption
-
-Re-run `bash run.sh` — completed phases are automatically skipped.
-To force re-run all phases: `FORCE_RERUN=1 bash run.sh`
 
 ## Project Structure
 
 ```
 nips-modelsteal/
 ├── README.md
-├── LICENSE
 ├── setup.sh                           # One-click environment setup
 ├── requirements.txt
-├── PROPOSAL.md
-├── PAPERS.md
-├── PLAN.md
-├── EXPERIMENTS.md
+├── PROPOSAL.md                        # Research proposal
+├── PAPERS.md                          # Related work
+├── PLAN.md                            # Experiment timeline
 ├── configs/
-│   └── inversion_config.yaml          # Inversion hyperparameters
+│   └── inversion_config.yaml          # S-PSI hyperparameters
 ├── src/
 │   ├── __init__.py
-│   ├── parameter_inverter.py          # Core inversion algorithm
-│   └── active_query.py               # Active query selection strategies
+│   ├── parameter_inverter.py          # Core S-PSI algorithm
+│   ├── permutation_alignment.py       # Hungarian alignment for identifiability
+│   └── active_query.py               # Query pool utilities
 ├── scripts/
-│   ├── gpu_utils.sh                   # Auto GPU detection utilities
-│   ├── run_all_experiments.sh         # Master pipeline (entry point)
-│   ├── run_parameter_inversion.sh     # Multi-GPU launcher
-│   ├── run_kd_baseline.py            # Step 1: KD baseline
-│   ├── run_progressive_inversion.py  # Step 2: Progressive inversion
-│   ├── eval_recovery_quality.py      # Step 3: Recovery evaluation
-│   ├── run_defense_eval.py           # Step 4: Defense evaluation
-│   ├── distill_student.py            # Student distillation
-│   ├── invert_parameters.py          # Parameter inversion core
-│   ├── eval_extraction.py            # Extraction quality metrics
-│   └── defense_evaluation.py         # Defense mechanism evaluation
+│   ├── run_spsi.py                    # Main S-PSI experiment
+│   ├── run_spsi_multigpu.sh           # Multi-GPU parallel init launcher
+│   ├── run_all_experiments.sh         # Full pipeline launcher
+│   ├── run_kd_baseline.py            # KD baseline for comparison
+│   ├── eval_recovery_quality.py      # Recovery evaluation
+│   ├── run_defense_eval.py           # Defense evaluation (appendix)
+│   └── gpu_utils.sh                  # GPU detection utilities
+├── refine-logs/                       # ARIS research refinement logs
+│   ├── FINAL_PROPOSAL.md
+│   ├── score-history.md
+│   └── round-*-*.md
 ├── results/                           # Experiment outputs
 └── logs/                              # Training logs
 ```
 
-## Experiments Overview
+## Method Overview
 
-| # | Experiment | Script | Expected Output |
-|---|-----------|--------|-----------------|
-| 1 | KD baseline (teacher → student) | `run_kd_baseline.py` | `results/kd_baseline/` |
-| 2 | Progressive inversion (3 strategies) | `run_progressive_inversion.py` | `results/progressive_inversion/strategy_comparison.json` |
-| 3 | Recovery quality evaluation | `eval_recovery_quality.py` | `results/recovery_evaluation/recovery_evaluation.json` |
-| 4 | Defense evaluation (4 defenses) | `run_defense_eval.py` | `results/defense_eval/defense_impact.json` |
-| 5 | Scaling analysis (vary query budget) | `run_progressive_inversion.py` | `results/scaling/` |
+S-PSI studies the **identifiability** of transformer weights from logit observations:
 
-### Expected Results
+1. **Phase 0**: Recover `lm_head` (output projection) via gradient-based optimization.
+2. **Phase 1-K**: Progressively recover transformer blocks from output to input.
+3. **Two regimes**:
+   - **Oracle-prefix**: Teacher boundary states injected → tests suffix identifiability.
+   - **Pure-logits**: Fully black-box → tests realistic attack scenario.
+4. **Sensitivity matching**: Match not only logits, but how logits respond to input
+   perturbations (token replacements). Stronger constraint on internal parameters.
+5. **Identifiability analysis**: 5 random initializations, permutation-aware alignment,
+   per-matrix cosine similarity breakdown.
 
-| Method | Weight Cosine Sim | Output Agreement | Downstream Acc Match |
-|--------|-------------------|------------------|---------------------|
-| Standard KD | 0.31 | 0.78 | 0.85 |
-| PPI (random) | 0.58 | 0.86 | 0.90 |
-| PPI (gradient magnitude) | 0.68 | 0.91 | 0.93 |
-| PPI (Fisher information) | 0.72 | 0.93 | 0.94 |
+## Experiments
+
+| # | Experiment | Script | Output |
+|---|-----------|--------|--------|
+| 1 | S-PSI oracle-prefix (5 inits) | `run_spsi.py --regime oracle` | `results/spsi_oracle/` |
+| 2 | S-PSI pure-logits (5 inits) | `run_spsi.py --regime pure_logits` | `results/spsi_pure_logits/` |
+| 3 | Sensitivity ablation (β=0) | `run_spsi.py --beta 0.0` | `results/spsi_ablation_beta0/` |
+| 4 | Wrong-teacher control | `run_spsi.py --wrong_teacher` | `results/spsi_wrong_teacher/` |
+| 5 | KD baseline | `run_kd_baseline.py` | `results/kd_baseline/` |
+| 6 | Depth boundary analysis | `run_spsi.py --num_suffix_blocks 6` | `results/spsi_depth/` |
+
+### Key Metrics
+
+- **Per-matrix cosine similarity**: Permutation-aligned, per weight matrix (Q/K/V/O/up/gate/down/norm).
+- **Cross-init variance**: Low variance = identifiable recovery.
+- **Oracle vs pure-logits gap**: Quantifies prefix-mismatch impact.
 
 ## Model
 
 | Role | Model | Params | Access |
 |------|-------|--------|--------|
-| Teacher | Qwen/Qwen3.5-4B | 4B | Black-box (logits only) |
-| Student | Qwen/Qwen3.5-4B | 4B | Full (weight recovery target) |
+| Teacher | Qwen/Qwen3.5-0.8B | 0.8B | Logits only (oracle: + boundary states) |
+| Student | Qwen/Qwen3.5-0.8B | 0.8B | Full (suffix recovery target) |
 
-## Timeline & GPU Budget
+## Compute Budget
 
-| Phase | Duration | GPU-hours |
-|-------|----------|-----------|
-| KD baseline training | ~2 days | 100 |
-| Progressive inversion (3 strategies) | ~4 days | 250 |
-| Recovery evaluation | ~1 day | 40 |
-| Defense evaluation (4 methods) | ~2 days | 120 |
-| Scaling analysis | ~1 day | 60 |
-| **Total** | **~10 days** | **~570** |
+| Experiment | GPU-hours |
+|-----------|-----------|
+| Teacher cache (one-time) | ~5 |
+| Oracle-prefix (5 inits × 2 blocks) | ~120 |
+| Pure-logits (5 inits × 2 blocks) | ~120 |
+| Ablations | ~60 |
+| Depth boundary | ~80 |
+| **Total** | **~385** |
 
 ## Citation
 
 ```bibtex
-@inproceedings{ppi2026,
-  title={Progressive Parameter Inversion: Recovering LLM Weights from Black-Box Access},
+@inproceedings{spsi2026,
+  title={S-PSI: How Identifiable Are Transformer Weights from Logits?},
   author={Anonymous},
   booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
   year={2026}

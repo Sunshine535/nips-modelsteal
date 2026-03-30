@@ -427,7 +427,7 @@ def plot_layer_recovery(per_layer_metrics, output_dir, label=""):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate Recovery Quality")
-    parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3.5-4B")
+    parser.add_argument("--teacher_model", type=str, default="Qwen/Qwen3.5-0.8B")
     parser.add_argument("--kd_model", type=str, default="results/kd_baseline/best_student")
     parser.add_argument("--inversion_model", type=str,
                         default="results/progressive_inversion/strategy_gradient_magnitude/recovered_model")
