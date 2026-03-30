@@ -1,9 +1,14 @@
 {
-  "round": 4,
+  "round": 5,
   "status": "completed",
-  "last_score": 6.0,
-  "last_verdict": "not ready — all critical code fixes implemented",
-  "pending_experiments": [],
-  "timestamp": "2026-03-30T14:00:00",
-  "note": "Max rounds reached. All critical code issues (permutation alignment, oracle boundary injection, wrong-teacher control, held-out generalization, query budget fairness, model saving) have been fixed. Experiments need to be run on server to produce actual results."
+  "last_score": 4.0,
+  "last_verdict": "not ready — multi-GPU aggregation, resume semantics, and legacy entry points remain unreliable",
+  "pending_experiments": [
+    "Fix multi-GPU result aggregation and fail-fast behavior",
+    "Implement explicit checkpoint resume support for S-PSI and KD",
+    "Port or remove stale legacy scripts that no longer match src/parameter_inverter.py",
+    "Run and log end-to-end experiments after the pipeline is repaired"
+  ],
+  "timestamp": "2026-03-31T00:00:00",
+  "note": "Round 5 review lowered the score because the advertised multi-GPU path writes shared summary files concurrently, checkpoint resume flags are misleading or incomplete, and several repository entry points are stale against the current S-PSI API. The codebase is not yet artifact-ready for reproducing paper results."
 }

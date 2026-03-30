@@ -128,3 +128,58 @@ Remaining Weaknesses:
 
 ### Status
 - Auto Review Loop complete (4 rounds reached)
+
+---
+
+## Round 5 (2026-03-31)
+
+### Score
+- 4/10
+- Verdict: Not ready to produce trustworthy experimental results
+
+### Findings
+1. **Fatal: the advertised multi-GPU path can silently produce incorrect aggregate results.**
+   - `scripts/run_spsi_multigpu.sh:62-72` and `scripts/run_all_experiments.sh:96-100` launch multiple `scripts/run_spsi.py` processes into the same output directory.
+   - `scripts/run_spsi.py:369-389` writes `regime_summary.json`, and `scripts/run_spsi.py:477-489` writes `experiment_summary.json`; with one-init jobs running concurrently, these shared summaries are overwritten by the last finisher.
+   - `scripts/run_all_experiments.sh:114-115` only logs a warning when an init fails and still returns success, after which `scripts/run_all_experiments.sh:160-172` marks the phase as done.
+   - Net effect: the code can report a completed multi-GPU experiment while cross-init statistics are incomplete or wrong.
+
+2. **High: checkpoint/resume support is incomplete and the CLI is misleading.**
+   - `scripts/run_spsi.py:129-130` exposes `--resume_from`, but the argument is never used.
+   - `src/parameter_inverter.py:430-444` auto-loads the latest checkpoint only from the implicit `output_dir/checkpoints` directory; there is no explicit resume target or validation that the resumed run matches the original configuration.
+   - `src/parameter_inverter.py:543-546` checkpoints only every `save_every` steps, and `_save_results()` is only called at the end of the full run (`src/parameter_inverter.py:640-641`, `src/parameter_inverter.py:694-700`). A crash between save intervals can therefore lose completed progress.
+   - `scripts/run_kd_baseline.py:330-331` advertises a path-valued `--resume_from_checkpoint`, but `scripts/run_kd_baseline.py:389` reduces it to a boolean and `scripts/run_kd_baseline.py:197-206` always resumes from the latest checkpoint in `output_dir`, ignoring any user-supplied path.
+
+3. **High: several repository entry points are stale and do not match the current `src/parameter_inverter.py` API.**
+   - `scripts/run_progressive_inversion.py:227` calls `invert_layer`, but `src/parameter_inverter.py:722-759` only exposes `run_progressive_inversion`.
+   - `scripts/run_progressive_inversion.py:281-292` and `scripts/run_progressive_inversion.py:346-357` pass `optimizer_type`, `regularization_lambda`, and `active_query_pool_size` into `InversionConfig`, but `src/parameter_inverter.py:710-720` does not define those fields.
+   - `scripts/invert_parameters.py:211-223` has the same unsupported `InversionConfig` kwargs, while `scripts/invert_parameters.py:245-248` depends on `result.recovered_state_dict` even though `src/parameter_inverter.py:91-93` always returns `None`.
+   - `scripts/run_defense_eval.py:179-187` passes `selection_batch` into `InversionConfig`, which is also unsupported.
+   - This is a code completeness problem, not just a cleanup issue: large parts of the advertised artifact are not maintained against the current implementation.
+
+4. **Medium: the repository is not yet in a reproducible-results state.**
+   - `EXPERIMENTS.md:28` explicitly says no experiments have been recorded.
+   - The checked-in `results/` directory is empty.
+   - `scripts/run_spsi.py:145-150` only reads `teacher.model_name` from `configs/inversion_config.yaml`; the inversion and evaluation hyperparameters documented in `configs/inversion_config.yaml:17-67` are not actually loaded into the main run.
+   - `scripts/run_spsi.py:55-71` and `scripts/run_kd_baseline.py:95-110` silently fall back to random-token queries when dataset loading fails, which can materially change the experiment without failing fast.
+
+5. **Medium: code quality and operational hygiene are below artifact-ready standard.**
+   - `src/parameter_inverter.py:322-333` leaves `_inject_boundary_state()` as dead `pass` code after the refactor to `_BoundaryInjectionHook`.
+   - `scripts/run_all_experiments.sh:123-133` force-kills any Python or `torchrun` process that appears to be using a GPU, which is unsafe behavior on a shared server.
+   - There are no tests or even smoke checks in the repository, so the broken API boundaries above are not caught automatically.
+
+### Open Questions / Assumptions
+- This review is based on static code inspection and parser-level checks. `python -m compileall src scripts` and `bash -n` passed, but I could not run the training code in this environment because PyTorch is not installed here.
+- The main single-GPU `scripts/run_spsi.py` path may be salvageable after dependency installation, but the repository as submitted claims a broader, more complete artifact than the code currently supports.
+
+### Actionable Feedback
+- Isolate each initialization into its own directory and add a dedicated aggregation step that merges all init-level summaries after all workers finish. Multi-GPU orchestration should fail hard if any init fails.
+- Implement real resume semantics: honor the user-provided checkpoint path/directory, save final checkpoints at block boundaries, and write enough metadata to verify restart compatibility.
+- Delete or port the stale scripts (`run_progressive_inversion.py`, `invert_parameters.py`, `run_defense_eval.py`) so every documented entry point matches the current `src/` API.
+- Make the YAML config authoritative for experiment hyperparameters and write the resolved config into every result directory.
+- Remove silent random-query fallback for official runs. If the dataset is unavailable, fail closed unless an explicit fallback flag is set.
+- Add smoke tests for one toy S-PSI run, one resume/restart path, and one multi-process aggregation path.
+
+### Verdict
+- Score: 4/10
+- The core idea is interesting, but the artifact is not ready to support trustworthy NeurIPS experimental results, especially in the advertised multi-GPU setting.
