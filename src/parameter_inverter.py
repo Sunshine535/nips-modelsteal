@@ -70,6 +70,10 @@ class BlockResult:
     num_queries: int = 0
     converged: bool = False
 
+    @property
+    def cosine_similarity(self) -> float:
+        return self.mean_cosine
+
 
 @dataclass
 class SPSIResult:
@@ -79,6 +83,14 @@ class SPSIResult:
     block_results: list = field(default_factory=list)
     total_queries: int = 0
     init_seed: int = 42
+
+    @property
+    def layer_results(self):
+        return self.block_results
+
+    @property
+    def recovered_state_dict(self) -> Optional[dict]:
+        return None
 
 
 class BlackBoxTeacher:
@@ -689,3 +701,60 @@ def _save_results(
         logger.info("Recovered model saved to %s", model_dir)
 
     logger.info("S-PSI results saved to %s", out)
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible aliases for scripts that use the old API
+# ---------------------------------------------------------------------------
+
+@dataclass
+class InversionConfig(SPSIConfig):
+    """Alias for SPSIConfig with legacy field names."""
+
+    max_steps_per_layer: int = 10_000
+    active_query_strategy: str = "gradient_magnitude"
+
+    def __post_init__(self):
+        if self.max_steps_per_block == 10_000 and self.max_steps_per_layer != 10_000:
+            self.max_steps_per_block = self.max_steps_per_layer
+
+
+class LayerWiseInverter:
+    """Wrapper that presents the functional run_spsi API as an OOP interface."""
+
+    def __init__(self, student_model, teacher, config, device="cuda"):
+        self.student = student_model
+        if isinstance(teacher, BlackBoxTeacher):
+            self.teacher = teacher
+        else:
+            self.teacher = BlackBoxTeacher(teacher, device=device)
+        self.config = config
+        self.device = device
+        self._query_pool = None
+
+    def set_query_pool(self, pool):
+        self._query_pool = pool
+
+    def run_progressive_inversion(
+        self,
+        teacher_ground_truth=None,
+        output_dir=None,
+        regime="oracle",
+        num_suffix_blocks=2,
+    ) -> SPSIResult:
+        cache = TeacherCache(device=self.device)
+        if self._query_pool is not None and hasattr(self._query_pool, "_pool"):
+            input_ids = self._query_pool._pool
+        else:
+            vocab_size = self.teacher.model.config.vocab_size
+            input_ids = torch.randint(
+                0, vocab_size,
+                (100, self.config.max_seq_len),
+                generator=torch.Generator().manual_seed(self.config.seed),
+            )
+        cache.build(self.teacher, input_ids, self.config)
+        return run_spsi(
+            self.student, self.teacher, cache, self.config,
+            regime=regime, num_suffix_blocks=num_suffix_blocks,
+            ground_truth=teacher_ground_truth, output_dir=output_dir,
+        )
