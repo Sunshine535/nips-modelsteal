@@ -43,7 +43,7 @@ is_phase_done() {
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-CONFIG="configs/inversion_config.yaml"
+CONFIG="${SPSI_CONFIG:-configs/inversion_config.yaml}"
 RESULTS_DIR="results"
 LOG_DIR="logs"
 SEED=42
@@ -54,6 +54,7 @@ NUM_SUFFIX=2
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --config)        CONFIG="$2"; shift 2 ;;
         --skip_kd)       SKIP_KD=true; shift ;;
         --skip_ablation) SKIP_ABLATION=true; shift ;;
         --gpus)          export NUM_GPUS="$2"; shift 2 ;;
@@ -75,6 +76,43 @@ run_timed() {
     "$@" 2>&1 | tee "$LOG_DIR/${name}.log"
     local elapsed=$(( SECONDS - start ))
     log "DONE:  $name (${elapsed}s)"
+}
+
+run_spsi_parallel() {
+    local regime="$1"; local out_dir="$2"; shift 2
+    local extra_args="$@"
+    if [ "$NUM_GPUS" -le 1 ] || [ "$NUM_INITS" -le 1 ]; then
+        python scripts/run_spsi.py \
+            --config "$CONFIG" --regime "$regime" \
+            --num_inits "$NUM_INITS" --num_suffix_blocks "$NUM_SUFFIX" \
+            --output_dir "$out_dir" --seed "$SEED" $extra_args
+        return
+    fi
+    log "  Multi-GPU S-PSI: $NUM_INITS inits across $NUM_GPUS GPUs"
+    local pids=() labels=() fail=0
+    for ((init=0; init<NUM_INITS; init++)); do
+        local gpu_id=$((init % NUM_GPUS))
+        local init_seed=$((SEED + init * 1000))
+        CUDA_VISIBLE_DEVICES=$(gpu_at_index $gpu_id) python scripts/run_spsi.py \
+            --config "$CONFIG" --regime "$regime" \
+            --num_inits 1 --init_offset "$init" --num_suffix_blocks "$NUM_SUFFIX" \
+            --output_dir "$out_dir" --seed "$init_seed" $extra_args \
+            > "$LOG_DIR/spsi_${regime}_init${init}.log" 2>&1 &
+        pids+=($!)
+        labels+=("init_${init}/gpu_${gpu_id}")
+        if (( (init + 1) % NUM_GPUS == 0 )) && (( init + 1 < NUM_INITS )); then
+            log "  Waiting for GPU batch..."
+            for j in "${!pids[@]}"; do
+                wait "${pids[$j]}" || { log "WARN: ${labels[$j]} failed"; fail=1; }
+            done
+            pids=() labels=()
+        fi
+    done
+    for j in "${!pids[@]}"; do
+        wait "${pids[$j]}" || { log "WARN: ${labels[$j]} failed"; fail=1; }
+    done
+    [ $fail -ne 0 ] && log "WARNING: Some S-PSI inits failed (check logs/)"
+    return 0
 }
 
 log "=== S-PSI Experiment Pipeline ==="
@@ -110,7 +148,8 @@ if [ "$SKIP_KD" = false ]; then
             --gradient_accumulation_steps 16 \
             --num_epochs 3 \
             --output_dir "$RESULTS_DIR/kd_baseline" \
-            --seed "$SEED"
+            --seed "$SEED" \
+            --resume_from_checkpoint auto
 fi
 phase_done A
 fi
@@ -120,13 +159,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════
 if ! is_phase_done B; then
     run_timed "02_spsi_oracle" \
-        python scripts/run_spsi.py \
-            --config "$CONFIG" \
-            --regime oracle \
-            --num_inits "$NUM_INITS" \
-            --num_suffix_blocks "$NUM_SUFFIX" \
-            --output_dir "$RESULTS_DIR/spsi_oracle" \
-            --seed "$SEED"
+        run_spsi_parallel oracle "$RESULTS_DIR/spsi_oracle"
     phase_done B
 fi
 
@@ -135,13 +168,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════
 if ! is_phase_done C; then
     run_timed "03_spsi_pure_logits" \
-        python scripts/run_spsi.py \
-            --config "$CONFIG" \
-            --regime pure_logits \
-            --num_inits "$NUM_INITS" \
-            --num_suffix_blocks "$NUM_SUFFIX" \
-            --output_dir "$RESULTS_DIR/spsi_pure_logits" \
-            --seed "$SEED"
+        run_spsi_parallel pure_logits "$RESULTS_DIR/spsi_pure_logits"
     phase_done C
 fi
 
@@ -151,14 +178,7 @@ fi
 if ! is_phase_done D; then
 if [ "$SKIP_ABLATION" = false ]; then
     run_timed "04_ablation_beta0" \
-        python scripts/run_spsi.py \
-            --config "$CONFIG" \
-            --regime both \
-            --beta 0.0 \
-            --num_inits "$NUM_INITS" \
-            --num_suffix_blocks "$NUM_SUFFIX" \
-            --output_dir "$RESULTS_DIR/spsi_ablation_beta0" \
-            --seed "$SEED"
+        run_spsi_parallel both "$RESULTS_DIR/spsi_ablation_beta0" --beta 0.0
 fi
 phase_done D
 fi

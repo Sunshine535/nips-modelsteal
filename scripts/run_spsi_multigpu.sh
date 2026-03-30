@@ -21,6 +21,7 @@ BETA="${BETA:-0.1}"
 SEED="${SEED:-42}"
 OUTPUT_DIR="${OUTPUT_DIR:-results/spsi_${REGIME}}"
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.5-0.8B}"
+CONFIG="${SPSI_CONFIG:-configs/inversion_config.yaml}"
 
 NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l || echo 1)
 
@@ -34,6 +35,7 @@ while [[ $# -gt 0 ]]; do
         --seed)       SEED="$2"; shift 2 ;;
         --output_dir) OUTPUT_DIR="$2"; shift 2 ;;
         --model)      MODEL_NAME="$2"; shift 2 ;;
+        --config)     CONFIG="$2"; shift 2 ;;
         *)            echo "Unknown arg: $1"; shift ;;
     esac
 done
@@ -58,13 +60,15 @@ for ((init=0; init<NUM_INITS; init++)); do
     log "  GPU $GPU_ID <- Init $init (seed=$INIT_SEED)"
 
     CUDA_VISIBLE_DEVICES=$GPU_ID python scripts/run_spsi.py \
+        --config "$CONFIG" \
         --model_name "$MODEL_NAME" \
         --regime "$REGIME" \
         --num_inits 1 \
+        --init_offset "$init" \
         --num_suffix_blocks "$NUM_SUFFIX" \
         --beta "$BETA" \
         --seed "$INIT_SEED" \
-        --output_dir "${OUTPUT_DIR}_init${init}" \
+        --output_dir "${OUTPUT_DIR}" \
         > "$LOG_FILE" 2>&1 &
 
     PIDS+=($!)

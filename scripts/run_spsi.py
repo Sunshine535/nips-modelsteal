@@ -30,7 +30,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.parameter_inverter import (
     BlackBoxTeacher,
+    BlockResult,
     SPSIConfig,
+    SPSIResult,
     TeacherCache,
     run_spsi,
 )
@@ -122,6 +124,8 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=10_000)
     parser.add_argument("--output_dir", type=str, default="results/spsi")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--init_offset", type=int, default=0,
+                        help="Offset for init index (for multi-GPU parallel runs)")
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Resume from a checkpoint directory")
     parser.add_argument("--wrong_teacher", action="store_true",
@@ -230,14 +234,39 @@ def main():
         regime_dir.mkdir(parents=True, exist_ok=True)
         regime_results = []
 
-        for init_idx in range(args.num_inits):
+        for raw_idx in range(args.num_inits):
+            init_idx = raw_idx + args.init_offset
             init_seed = args.seed + init_idx * 1000
             torch.manual_seed(init_seed)
 
             logger.info(
                 "\n=== Regime: %s | Init %d/%d (seed=%d) ===",
-                regime, init_idx + 1, args.num_inits, init_seed,
+                regime, raw_idx + 1, args.num_inits, init_seed,
             )
+
+            init_dir = str(regime_dir / f"init_{init_idx}")
+            summary_file = Path(init_dir) / "spsi_summary.json"
+            if summary_file.exists() and not os.environ.get("FORCE_RERUN"):
+                logger.info("Init %d already complete (%s exists), skipping.", init_idx, summary_file)
+                try:
+                    with open(summary_file) as _f:
+                        _prev = json.load(_f)
+                    regime_results.append(SPSIResult(
+                        regime=regime, init_seed=init_seed,
+                        block_results=[BlockResult(
+                            block_name=b["name"],
+                            per_matrix_cosine=b.get("per_matrix_cosine", {}),
+                            mean_cosine=b.get("mean_cosine", -1.0),
+                            final_loss=b.get("final_loss", 0),
+                            num_steps=b.get("num_steps", 0),
+                            num_queries=b.get("num_queries", 0),
+                            converged=b.get("converged", False),
+                        ) for b in _prev.get("blocks", [])],
+                        total_queries=_prev.get("total_queries", 0),
+                    ))
+                except Exception:
+                    pass
+                continue
 
             student = AutoModelForCausalLM.from_pretrained(
                 args.model_name, torch_dtype=torch.bfloat16,
@@ -264,8 +293,6 @@ def main():
 
             if hasattr(student, "gradient_checkpointing_enable"):
                 student.gradient_checkpointing_enable()
-
-            init_dir = str(regime_dir / f"init_{init_idx}")
 
             result = run_spsi(
                 student=student,
