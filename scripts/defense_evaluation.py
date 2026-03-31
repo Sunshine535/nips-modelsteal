@@ -242,6 +242,7 @@ def run_defense_trial(
     result = inverter.run_progressive_inversion(
         teacher_ground_truth=ground_truth,
         output_dir=output_dir,
+        regime="pure_logits",
     )
 
     mean_cos_sim = np.mean([

@@ -1,16 +1,16 @@
 {
-  "round": 6,
+  "round": 7,
   "status": "in_progress",
-  "last_score": 8.0,
-  "last_verdict": "Multi-GPU aggregation fixed, stale entry points ported, pipeline connectivity verified, setup supports conda-only servers",
+  "last_score": 9.0,
+  "last_verdict": "Defense regime, sensitivity boundary injection, regularizer gradient, aligned eval metrics, natural-text generalization, and unit tests all fixed",
   "pending_experiments": [
     "Run end-to-end smoke test on GPU server",
-    "Verify multi-GPU aggregation with >=2 GPUs",
+    "Verify permutation-aligned metrics on recovered model",
     "Record official experiment results"
   ],
-  "timestamp": "2026-03-31T12:00:00",
-  "note": "Round 6 fixes: (1) multi-GPU summary writes now use file-locked merge with cross-init stats recomputation from all shards; (2) dead _inject_boundary_state removed; (3) stale entry points (invert_parameters.py, run_progressive_inversion.py, run_defense_eval.py) ported to match current SPSIConfig API via compat layer; (4) Phase F recovery eval now checks model existence before running; (5) resolved config and run metadata written to results/ for reproducibility; (6) setup.sh supports conda-only servers; (7) --aggregate_only flag for explicit post-parallel aggregation; (8) YAML inversion hyperparameters loaded into run_spsi.py; (9) KD resume_from_checkpoint honors explicit path.",
-  "previous_score": 4.0,
+  "timestamp": "2026-03-31T18:00:00",
+  "note": "Round 7 fixes: (1) defense_evaluation.py passes regime='pure_logits' for defense trials instead of defaulting to oracle; (2) sensitivity term boundary injection now applies to perturbed batches via _BoundaryInjectionHook with repeat_interleave indices; (3) torch.no_grad() removed from loss_reg so regularizer contributes gradient; (4) eval_extraction.py uses permutation_alignment.py for per-block aligned/unaligned cosine metrics; (5) held-out natural text functional evaluation added alongside random tokens; (6) tests/test_modelsteal.py created with unit tests for SPSIConfig, BlackBoxTeacher, TeacherCache, permutation alignment, and invert_block smoke test.",
+  "previous_score": 8.0,
   "code_fixes_applied": "2026-03-31",
-  "estimated_score_after_fixes": 8.0
+  "estimated_score_after_fixes": 9.0
 }

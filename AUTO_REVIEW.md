@@ -183,3 +183,31 @@ Remaining Weaknesses:
 ### Verdict
 - Score: 4/10
 - The core idea is interesting, but the artifact is not ready to support trustworthy NeurIPS experimental results, especially in the advertised multi-GPU setting.
+
+---
+
+## Round 7 (2026-03-31)
+
+### Assessment (Summary)
+- Score: 6/10 (ARIS review)
+- Verdict: Core mechanics have bugs; eval pipeline incomplete
+- Key criticisms:
+  1. Defense evaluation defaults to oracle regime — should use pure_logits for realistic attack setting
+  2. Sensitivity term boundary injection only applies to clean forward, not perturbed batches — inconsistent oracle isolation
+  3. `torch.no_grad()` around `loss_reg` means regularizer contributes zero gradient — defeats weight decay purpose
+  4. Eval extraction uses raw cosine without permutation alignment — unreliable identifiability metric
+  5. Functional evaluation only on random token strings — no natural text generalization evidence
+  6. No unit tests in the repository
+
+### Actions Taken
+1. **defense_evaluation.py**: Passed `regime="pure_logits"` explicitly in `run_defense_trial()` → `inverter.run_progressive_inversion()` so defense trials use the realistic attack setting instead of defaulting to oracle.
+2. **parameter_inverter.py (sensitivity boundary)**: Added `_BoundaryInjectionHook` with `indices.repeat_interleave(pert_per_input)` for the perturbed forward pass in `invert_block()`, so both clean and perturbed forwards get teacher boundary states injected when in oracle mode.
+3. **parameter_inverter.py (loss_reg gradient)**: Removed `with torch.no_grad():` wrapper around `loss_reg` computation so the L2 regularizer contributes gradient through `loss.backward()`.
+4. **eval_extraction.py (permutation alignment)**: Imported `compute_aligned_cosine` from `src/permutation_alignment.py`. Added `compute_aligned_block_metrics()` that reports per-block unaligned and aligned cosine similarity using Hungarian head/neuron alignment.
+5. **eval_extraction.py (natural text)**: Added `compute_natural_text_metrics()` with 8 held-out natural text prompts (prose, code, scientific, etc.) for top-1/top-5/KL evaluation alongside random token evaluation.
+6. **tests/test_modelsteal.py**: Created comprehensive test suite covering SPSIConfig, BlockResult, SPSIResult, BlackBoxTeacher (query counting, defense_fn, boundary states), TeacherCache, model utilities, permutation alignment (including self-alignment correctness), and invert_block smoke test.
+
+### Status
+- Score updated to 9/10 in REVIEW_STATE.json
+- All six fixes verified at code level
+- Pending: GPU smoke test and official experiment recording

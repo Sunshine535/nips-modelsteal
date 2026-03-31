@@ -486,8 +486,16 @@ def invert_block(
 
         loss_sensitivity = torch.tensor(0.0, device=device)
         if config.beta > 0 and len(pert_ids) > 0:
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                z_s_pert = student(pert_ids).logits
+            if oracle_boundary:
+                pert_indices = indices.repeat_interleave(pert_per_input)
+                ctx_pert = _BoundaryInjectionHook(
+                    student, cache, pert_indices, boundary_idx,
+                )
+            else:
+                ctx_pert = nullcontext()
+            with ctx_pert:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    z_s_pert = student(pert_ids).logits
             delta_s = z_s_pert.float() - z_s.detach().float().repeat_interleave(
                 pert_per_input, dim=0
             )
@@ -496,8 +504,7 @@ def invert_block(
             )
             loss_sensitivity = F.mse_loss(delta_s, delta_t)
 
-        with torch.no_grad():
-            loss_reg = sum(p.float().norm(2) ** 2 for p in trainable)
+        loss_reg = sum(p.float().norm(2) ** 2 for p in trainable)
 
         loss = (
             config.alpha * loss_logit

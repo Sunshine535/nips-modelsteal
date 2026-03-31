@@ -33,6 +33,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.permutation_alignment import compute_aligned_cosine
+
 logger = logging.getLogger(__name__)
 
 
@@ -174,6 +176,131 @@ def compute_functional_metrics(
     }
 
 
+# ── Permutation-Aligned Block Metrics ────────────────────────────────
+
+def compute_aligned_block_metrics(
+    teacher_model, recovered_model
+) -> list[dict]:
+    """Per-block cosine similarity with and without permutation alignment."""
+    teacher_sd = {n: p.data.clone() for n, p in teacher_model.named_parameters()}
+    recovered_sd = {n: p.data.clone() for n, p in recovered_model.named_parameters()}
+
+    config = teacher_model.config
+    num_heads = getattr(config, "num_attention_heads", 32)
+    head_dim = getattr(config, "hidden_size", 4096) // num_heads
+
+    block_indices: dict[int, str] = {}
+    for name in teacher_sd:
+        parts = name.split(".")
+        for p in parts:
+            if p.isdigit():
+                idx = int(p)
+                prefix = name[: name.index(f".{p}.") + len(f".{p}")]
+                if idx not in block_indices:
+                    dot_pos = name.index(f".{p}.")
+                    block_indices[idx] = name[: dot_pos + len(f".{p}")]
+                break
+
+    block_prefixes: dict[int, str] = {}
+    for name in teacher_sd:
+        parts = name.split(".")
+        for i, p in enumerate(parts):
+            if p.isdigit():
+                idx = int(p)
+                prefix = ".".join(parts[: i + 1])
+                if idx not in block_prefixes or len(prefix) < len(block_prefixes[idx]):
+                    block_prefixes[idx] = prefix
+                break
+
+    results = []
+    for idx in sorted(block_prefixes.keys()):
+        prefix = block_prefixes[idx]
+        try:
+            unaligned, aligned = compute_aligned_cosine(
+                recovered_sd, teacher_sd, prefix, num_heads, head_dim,
+            )
+        except Exception as e:
+            logger.warning("Alignment failed for block %d: %s", idx, e)
+            continue
+
+        mean_unaligned = np.mean(list(unaligned.values())) if unaligned else -1.0
+        mean_aligned = np.mean(list(aligned.values())) if aligned else -1.0
+        results.append({
+            "block_idx": idx,
+            "prefix": prefix,
+            "mean_cosine_unaligned": float(mean_unaligned),
+            "mean_cosine_aligned": float(mean_aligned),
+            "per_param_unaligned": {k: float(v) for k, v in unaligned.items()},
+            "per_param_aligned": {k: float(v) for k, v in aligned.items()},
+        })
+
+    return results
+
+
+# ── Natural-Text Functional Evaluation ───────────────────────────────
+
+HELD_OUT_TEXTS = [
+    "The quick brown fox jumps over the lazy dog near the riverbank.",
+    "In recent years, large language models have demonstrated remarkable capabilities.",
+    "def fibonacci(n):\n    if n <= 1:\n        return n\n    return fibonacci(n-1) + fibonacci(n-2)",
+    "Climate change poses significant challenges to global food security and biodiversity.",
+    "The eigenvalues of a symmetric matrix are always real numbers.",
+    "To make a classic margherita pizza, start with fresh dough and San Marzano tomatoes.",
+    "According to the second law of thermodynamics, entropy in an isolated system never decreases.",
+    "She walked through the ancient forest, where sunlight filtered through the canopy above.",
+]
+
+
+@torch.no_grad()
+def compute_natural_text_metrics(
+    teacher_model,
+    recovered_model,
+    tokenizer,
+    device: str = "cuda",
+) -> dict[str, float]:
+    """Functional evaluation on held-out natural text (not random tokens)."""
+    teacher_model.eval()
+    recovered_model.eval()
+
+    total_match = 0
+    total_kl = 0.0
+    total_tokens = 0
+    total_top5_match = 0
+
+    for text in HELD_OUT_TEXTS:
+        enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
+        input_ids = enc["input_ids"].to(device)
+
+        teacher_logits = teacher_model(input_ids).logits
+        recovered_logits = recovered_model(input_ids).logits
+
+        seq_len = input_ids.size(1)
+        teacher_preds = teacher_logits.argmax(dim=-1)
+        recovered_preds = recovered_logits.argmax(dim=-1)
+        total_match += (teacher_preds == recovered_preds).sum().item()
+
+        teacher_top5 = teacher_logits.topk(5, dim=-1).indices
+        recovered_top5 = recovered_logits.topk(5, dim=-1).indices
+        for j in range(seq_len):
+            t_set = set(teacher_top5[0, j].tolist())
+            r_set = set(recovered_top5[0, j].tolist())
+            total_top5_match += len(t_set & r_set) / 5.0
+
+        t_probs = F.softmax(teacher_logits, dim=-1)
+        r_log_probs = F.log_softmax(recovered_logits, dim=-1)
+        kl = F.kl_div(r_log_probs, t_probs, reduction="sum").item()
+        total_kl += kl
+        total_tokens += seq_len
+
+    return {
+        "natural_top1_match_rate": total_match / max(total_tokens, 1),
+        "natural_top5_overlap_rate": total_top5_match / max(total_tokens, 1),
+        "natural_mean_kl_divergence": total_kl / max(total_tokens, 1),
+        "num_texts": len(HELD_OUT_TEXTS),
+        "total_tokens": total_tokens,
+    }
+
+
 # ── Depth-Recovery Curve ─────────────────────────────────────────────
 
 def extract_depth_curve(per_layer: dict[str, dict[str, float]]) -> list[dict]:
@@ -312,13 +439,24 @@ def main():
             m["mean_l2_distance"], m["num_layers"], f"{m['total_params']:,}",
         )
 
+    # --- Permutation-aligned block metrics ---
+    logger.info("Computing permutation-aligned block metrics...")
+    aligned_blocks = compute_aligned_block_metrics(teacher_model, recovered_model)
+    if aligned_blocks:
+        logger.info("=== Aligned Block Summary ===")
+        for b in aligned_blocks:
+            logger.info(
+                "  block_%d: unaligned=%.4f, aligned=%.4f",
+                b["block_idx"], b["mean_cosine_unaligned"], b["mean_cosine_aligned"],
+            )
+
     # --- Depth-recovery curve ---
     depth_curve = extract_depth_curve(per_layer)
     plot_depth_curve(depth_curve, str(output_dir / "depth_recovery_curve.png"))
     plot_component_comparison(aggregated, str(output_dir / "component_comparison.png"))
 
-    # --- Function-space evaluation ---
-    logger.info("Computing functional metrics (%d samples)...", args.num_eval_samples)
+    # --- Function-space evaluation (random tokens) ---
+    logger.info("Computing functional metrics (%d samples, random tokens)...", args.num_eval_samples)
     func_metrics = compute_functional_metrics(
         teacher_model, recovered_model, tokenizer,
         num_samples=args.num_eval_samples,
@@ -327,9 +465,19 @@ def main():
         device=device,
     )
 
-    logger.info("=== Function-Space Summary ===")
+    logger.info("=== Function-Space Summary (Random Tokens) ===")
     for k, v in func_metrics.items():
         logger.info("  %s: %.4f", k, v)
+
+    # --- Function-space evaluation (natural text) ---
+    logger.info("Computing functional metrics on held-out natural text...")
+    natural_metrics = compute_natural_text_metrics(
+        teacher_model, recovered_model, tokenizer, device=device,
+    )
+
+    logger.info("=== Function-Space Summary (Natural Text) ===")
+    for k, v in natural_metrics.items():
+        logger.info("  %s: %s", k, v)
 
     # --- Save all results ---
     results = {
@@ -337,8 +485,12 @@ def main():
             "per_layer": {k: v for k, v in per_layer.items()},
             "aggregated": aggregated,
             "depth_curve": depth_curve,
+            "aligned_blocks": aligned_blocks,
         },
-        "function_space": func_metrics,
+        "function_space": {
+            "random_tokens": func_metrics,
+            "natural_text": natural_metrics,
+        },
         "config": {
             "teacher_model": args.teacher_model,
             "recovered_model": args.recovered_model,
