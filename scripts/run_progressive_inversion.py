@@ -14,6 +14,9 @@ Usage:
         --output_dir results/progressive_inversion
 
     torchrun --nproc_per_node=4 scripts/run_progressive_inversion.py ...
+
+DEPRECATED: This script uses the legacy InversionConfig/LayerWiseInverter API.
+For new experiments, use run_spsi.py with the SPSIConfig-based pipeline.
 """
 
 import argparse
@@ -236,7 +239,6 @@ def run_phase(
         "layer_result": {
             "layer_name": result.layer_name,
             "cosine_similarity": result.cosine_similarity,
-            "l2_distance": result.l2_distance,
             "final_loss": result.final_loss,
             "num_steps": result.num_steps,
             "num_queries_used": result.num_queries_used,

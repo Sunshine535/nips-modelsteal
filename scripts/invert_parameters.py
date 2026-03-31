@@ -17,6 +17,9 @@ Usage:
 
     # Multi-GPU:
     torchrun --nproc_per_node=8 scripts/invert_parameters.py ...
+
+DEPRECATED: This script uses the legacy InversionConfig/LayerWiseInverter API.
+For new experiments, use run_spsi.py with the SPSIConfig-based pipeline.
 """
 
 import argparse
@@ -105,27 +108,6 @@ def build_query_pool(
         pool.build_random(tokenizer.vocab_size)
 
     return pool
-
-
-def save_recovered_model(
-    student_model,
-    recovered_state_dict: dict,
-    output_dir: str,
-    tokenizer,
-):
-    """Save the model with recovered weights."""
-    out = Path(output_dir) / "recovered_model"
-    out.mkdir(parents=True, exist_ok=True)
-
-    current_sd = student_model.state_dict()
-    for key, value in recovered_state_dict.items():
-        if key in current_sd:
-            current_sd[key] = value
-
-    student_model.load_state_dict(current_sd)
-    student_model.save_pretrained(out)
-    tokenizer.save_pretrained(out)
-    logger.info("Saved recovered model to %s", out)
 
 
 def parse_args():
@@ -241,18 +223,20 @@ def main():
         output_dir=args.output_dir,
     )
 
-    # --- Save recovered model ---
-    if rank == 0 and result.recovered_state_dict:
-        save_recovered_model(
-            student_model, result.recovered_state_dict, args.output_dir, tokenizer
-        )
+    if rank == 0:
+        model_to_save = student_model
+        out = Path(args.output_dir) / "recovered_model"
+        out.mkdir(parents=True, exist_ok=True)
+        model_to_save.save_pretrained(str(out))
+        tokenizer.save_pretrained(str(out))
+        logger.info("Saved recovered model to %s", out)
 
         logger.info("=== Inversion Summary ===")
         logger.info("Total queries used: %d", result.total_queries)
         for lr in result.layer_results:
             logger.info(
-                "  %s: cos_sim=%.4f, l2=%.4f, loss=%.6f, steps=%d, queries=%d",
-                lr.layer_name, lr.cosine_similarity, lr.l2_distance,
+                "  %s: cos_sim=%.4f, loss=%.6f, steps=%d, queries=%d",
+                lr.layer_name, lr.cosine_similarity,
                 lr.final_loss, lr.num_steps, lr.num_queries_used,
             )
 

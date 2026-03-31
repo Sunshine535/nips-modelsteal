@@ -74,6 +74,18 @@ class BlockResult:
     def cosine_similarity(self) -> float:
         return self.mean_cosine
 
+    @property
+    def layer_name(self) -> str:
+        return self.block_name
+
+    @property
+    def l2_distance(self) -> float:
+        return -1.0
+
+    @property
+    def num_queries_used(self) -> int:
+        return self.num_queries
+
 
 @dataclass
 class SPSIResult:
@@ -319,19 +331,6 @@ def compute_per_matrix_cosine(
     return metrics
 
 
-def _inject_boundary_state(
-    student: nn.Module,
-    boundary_state: torch.Tensor,
-    block_idx: int,
-) -> None:
-    """Register a forward hook that replaces block input with teacher boundary state.
-
-    The hook intercepts the forward pass of block `block_idx` and substitutes
-    the incoming hidden state with the teacher's cached boundary state.
-    """
-    pass
-
-
 class _BoundaryInjectionHook:
     """Context manager that injects teacher boundary states into a student block."""
 
@@ -572,11 +571,19 @@ def run_spsi(
     ground_truth: Optional[dict] = None,
     output_dir: Optional[str] = None,
     init_seed: int = 42,
+    resume_dir: Optional[str] = None,
 ) -> SPSIResult:
     """Run complete S-PSI pipeline."""
     result = SPSIResult(regime=regime, init_seed=init_seed)
     num_blocks = get_num_blocks(student)
     ckpt_dir = str(Path(output_dir) / "checkpoints") if output_dir else None
+    if resume_dir:
+        candidate = Path(resume_dir) / "checkpoints"
+        if candidate.is_dir():
+            ckpt_dir = str(candidate)
+        elif Path(resume_dir).is_dir():
+            ckpt_dir = resume_dir
+        logger.info("Resuming from checkpoint dir: %s", ckpt_dir)
     use_oracle = regime == "oracle"
     precompute_queries = teacher.query_count
     budget_remaining = config.query_budget - precompute_queries
@@ -713,6 +720,9 @@ class InversionConfig(SPSIConfig):
 
     max_steps_per_layer: int = 10_000
     active_query_strategy: str = "gradient_magnitude"
+    active_query_pool_size: int = 10_000
+    optimizer_type: str = "adam"
+    regularization_lambda: float = 1e-4
 
     def __post_init__(self):
         if self.max_steps_per_block == 10_000 and self.max_steps_per_layer != 10_000:
@@ -734,6 +744,24 @@ class LayerWiseInverter:
 
     def set_query_pool(self, pool):
         self._query_pool = pool
+
+    def invert_layer(self, layer_names, target_params=None, ground_truth=None):
+        """Backward-compat wrapper: invert a group of parameters via invert_block."""
+        cache = TeacherCache(device=self.device)
+        if self._query_pool is not None and hasattr(self._query_pool, "_pool"):
+            input_ids = self._query_pool._pool
+        else:
+            vocab_size = self.teacher.model.config.vocab_size
+            input_ids = torch.randint(
+                0, vocab_size,
+                (100, self.config.max_seq_len),
+                generator=torch.Generator().manual_seed(self.config.seed),
+            )
+        cache.build(self.teacher, input_ids, self.config)
+        return invert_block(
+            self.student, cache, self.config, layer_names,
+            ground_truth=ground_truth,
+        )
 
     def run_progressive_inversion(
         self,

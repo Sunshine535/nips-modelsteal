@@ -87,7 +87,7 @@ def setup_distributed():
     return 0, 1, 0
 
 
-def build_query_dataset(tokenizer, num_queries: int, max_seq_len: int, seed: int = 42):
+def build_query_dataset(tokenizer, num_queries: int, max_seq_len: int, seed: int = 42, allow_synthetic: bool = False):
     """Build queries from wikitext, falling back to random tokens."""
     rng = torch.Generator().manual_seed(seed)
     input_ids_list = []
@@ -107,10 +107,19 @@ def build_query_dataset(tokenizer, num_queries: int, max_seq_len: int, seed: int
             )
             input_ids_list.append(tokens["input_ids"].squeeze(0))
     except Exception as e:
-        logger.warning("Dataset load failed: %s. Using random tokens.", e)
+        if not allow_synthetic:
+            raise RuntimeError(
+                f"Dataset load failed: {e}. Use --allow_synthetic to fall back to random tokens."
+            ) from e
+        logger.warning("Dataset load failed: %s. Falling back to random tokens (--allow_synthetic).", e)
 
     remaining = num_queries - len(input_ids_list)
     if remaining > 0:
+        if not allow_synthetic:
+            raise RuntimeError(
+                f"Only {len(input_ids_list)}/{num_queries} queries from dataset. "
+                "Use --allow_synthetic to pad with random tokens."
+            )
         random_ids = torch.randint(3, tokenizer.vocab_size, (remaining, max_seq_len), generator=rng)
         for i in range(remaining):
             input_ids_list.append(random_ids[i])
@@ -151,7 +160,7 @@ def collect_teacher_logits(teacher_model, dataset, batch_size, device, temperatu
 
 def train_kd_student(
     student_model, train_dataset, args, rank=0, world_size=1, local_rank=0,
-    resume_from_checkpoint=False,
+    resume_from_checkpoint=None,
 ):
     """Train student via KL divergence distillation from sparse top-K teacher logits."""
     device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
@@ -195,7 +204,13 @@ def train_kd_student(
     start_epoch = 0
 
     if resume_from_checkpoint:
-        ckpt_path = find_latest_checkpoint(str(output_dir), "checkpoint_epoch*.pt")
+        if isinstance(resume_from_checkpoint, bool) or resume_from_checkpoint == "auto":
+            ckpt_path = find_latest_checkpoint(str(output_dir), "checkpoint_epoch*.pt")
+        elif Path(resume_from_checkpoint).exists():
+            ckpt_path = resume_from_checkpoint
+        else:
+            logger.warning("Checkpoint path not found: %s; trying auto-detect", resume_from_checkpoint)
+            ckpt_path = find_latest_checkpoint(str(output_dir), "checkpoint_epoch*.pt")
         if ckpt_path:
             logger.info("Resuming from %s", ckpt_path)
             start_epoch, global_step = load_training_checkpoint(ckpt_path, student_model, optimizer)
@@ -329,6 +344,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="'auto' to resume from latest checkpoint, or path")
+    parser.add_argument("--allow_synthetic", action="store_true",
+                        help="Allow fallback to random tokens if dataset load fails")
     return parser.parse_args()
 
 
@@ -362,7 +379,7 @@ def main():
             device_map={"": device}, trust_remote_code=True,
         )
         logger.info("Building query dataset (%d queries)...", num_queries)
-        query_dataset = build_query_dataset(tokenizer, num_queries, args.max_seq_len, args.seed)
+        query_dataset = build_query_dataset(tokenizer, num_queries, args.max_seq_len, args.seed, allow_synthetic=args.allow_synthetic)
         logger.info("Collecting teacher logits (batch_size=32)...")
         distill_dataset = collect_teacher_logits(
             teacher_model, query_dataset, batch_size=32, device=device, temperature=args.temperature,
@@ -386,7 +403,7 @@ def main():
     student_model.apply(lambda m: m.reset_parameters() if hasattr(m, "reset_parameters") else None)
 
     train_kd_student(student_model, distill_dataset, args, rank, world_size, local_rank,
-                     resume_from_checkpoint=bool(args.resume_from_checkpoint))
+                     resume_from_checkpoint=args.resume_from_checkpoint)
 
     if rank == 0:
         tokenizer.save_pretrained(Path(args.output_dir) / "best_student")

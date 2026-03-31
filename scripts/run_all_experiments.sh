@@ -26,6 +26,9 @@ auto_setup
 PROJ_DIR_ROOT="$(dirname "$SCRIPT_DIR")"
 if [ -f "$PROJ_DIR_ROOT/.venv/bin/activate" ]; then
     source "$PROJ_DIR_ROOT/.venv/bin/activate"
+elif [ -d "$PROJ_DIR_ROOT/.conda_env" ] && command -v conda &>/dev/null; then
+    eval "$(conda shell.bash hook)"
+    conda activate "$PROJ_DIR_ROOT/.conda_env"
 fi
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -73,8 +76,13 @@ run_timed() {
     local name="$1"; shift
     log "START: $name"
     local start=$SECONDS
-    "$@" 2>&1 | tee "$LOG_DIR/${name}.log"
+    local rc=0
+    "$@" 2>&1 | tee "$LOG_DIR/${name}.log" || rc=$?
     local elapsed=$(( SECONDS - start ))
+    if [ $rc -ne 0 ]; then
+        log "FAILED: $name (${elapsed}s, exit=$rc)"
+        return $rc
+    fi
     log "DONE:  $name (${elapsed}s)"
 }
 
@@ -111,29 +119,45 @@ run_spsi_parallel() {
     for j in "${!pids[@]}"; do
         wait "${pids[$j]}" || { log "WARN: ${labels[$j]} failed"; fail=1; }
     done
-    [ $fail -ne 0 ] && log "WARNING: Some S-PSI inits failed (check logs/)"
-    return 0
+    if [ $fail -ne 0 ]; then
+        log "ERROR: Some S-PSI inits failed — aborting (check logs/)"
+        return 1
+    fi
+
+    log "  Aggregating multi-GPU results..."
+    python scripts/run_spsi.py \
+        --config "$CONFIG" --regime "$regime" \
+        --output_dir "$out_dir" --aggregate_only
 }
 
 log "=== S-PSI Experiment Pipeline ==="
 log "Using $NUM_GPUS GPU(s). TORCHRUN: $TORCHRUN"
 log "Inits: $NUM_INITS | Suffix blocks: $NUM_SUFFIX | Seed: $SEED"
 
-# Kill stale GPU processes
-log "Checking for stale GPU processes..."
-for _attempt in 1 2; do
-    STALE_PIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u || true)
-    if [ -z "$STALE_PIDS" ]; then break; fi
-    log "WARNING: Found GPU processes (attempt $_attempt): $STALE_PIDS"
-    for spid in $STALE_PIDS; do
-        CMDLINE=$(ps -p "$spid" -o comm= 2>/dev/null || true)
-        if [[ "$CMDLINE" == *python* ]] || [[ "$CMDLINE" == *torchrun* ]]; then
-            log "  Killing stale process $spid ($CMDLINE)"
-            kill -9 "$spid" 2>/dev/null || true
-        fi
-    done
+# Save resolved config and run metadata for reproducibility
+mkdir -p "$RESULTS_DIR"
+cp "$CONFIG" "$RESULTS_DIR/resolved_config.yaml" 2>/dev/null || true
+cat > "$RESULTS_DIR/run_metadata.json" << METAEOF
+{
+  "start_time": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+  "hostname": "$(hostname)",
+  "gpus": $NUM_GPUS,
+  "seed": $SEED,
+  "num_inits": $NUM_INITS,
+  "num_suffix_blocks": $NUM_SUFFIX,
+  "config": "$CONFIG",
+  "force_rerun": "$FORCE_RERUN"
+}
+METAEOF
+
+# Warn about existing GPU processes (do NOT kill — unsafe on shared machines)
+STALE_PIDS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u || true)
+if [ -n "$STALE_PIDS" ]; then
+    log "WARNING: Found existing GPU processes: $STALE_PIDS"
+    log "  If these are from a previous run, kill them manually before re-running."
+    log "  Continuing in 5 seconds..."
     sleep 5
-done
+fi
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Phase A: KD Baseline
@@ -224,20 +248,32 @@ fi
 if ! is_phase_done F; then
     if [ -d "$RESULTS_DIR/kd_baseline/best_student" ]; then
         KD_MODEL="$RESULTS_DIR/kd_baseline/best_student"
-    else
+    elif [ -d "$RESULTS_DIR/kd_baseline/final_student" ]; then
         KD_MODEL="$RESULTS_DIR/kd_baseline/final_student"
+    else
+        log "WARNING: No KD student model found; skipping Phase F"
+        phase_done F
+        KD_MODEL=""
     fi
-    INV_MODEL="$RESULTS_DIR/spsi_oracle/regime_oracle/init_0/recovered_model"
 
-    run_timed "06_eval_recovery" \
-        $TORCHRUN scripts/eval_recovery_quality.py \
-            --config "$CONFIG" \
-            --kd_model "$KD_MODEL" \
-            --inversion_model "$INV_MODEL" \
-            --output_dir "$RESULTS_DIR/recovery_evaluation" \
-            --num_output_samples 2000 \
-            --downstream_samples 200
-    phase_done F
+    INV_MODEL="$RESULTS_DIR/spsi_oracle/regime_oracle/init_0/recovered_model"
+    if [ ! -d "$INV_MODEL" ]; then
+        log "WARNING: No S-PSI recovered model at $INV_MODEL; skipping Phase F"
+        phase_done F
+        INV_MODEL=""
+    fi
+
+    if [ -n "$KD_MODEL" ] && [ -n "$INV_MODEL" ]; then
+        run_timed "06_eval_recovery" \
+            $TORCHRUN scripts/eval_recovery_quality.py \
+                --config "$CONFIG" \
+                --kd_model "$KD_MODEL" \
+                --inversion_model "$INV_MODEL" \
+                --output_dir "$RESULTS_DIR/recovery_evaluation" \
+                --num_output_samples 2000 \
+                --downstream_samples 200
+        phase_done F
+    fi
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────

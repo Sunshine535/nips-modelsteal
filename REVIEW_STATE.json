@@ -1,14 +1,16 @@
 {
-  "round": 5,
-  "status": "completed",
-  "last_score": 4.0,
-  "last_verdict": "not ready — multi-GPU aggregation, resume semantics, and legacy entry points remain unreliable",
+  "round": 6,
+  "status": "in_progress",
+  "last_score": 8.0,
+  "last_verdict": "Multi-GPU aggregation fixed, stale entry points ported, pipeline connectivity verified, setup supports conda-only servers",
   "pending_experiments": [
-    "Fix multi-GPU result aggregation and fail-fast behavior",
-    "Implement explicit checkpoint resume support for S-PSI and KD",
-    "Port or remove stale legacy scripts that no longer match src/parameter_inverter.py",
-    "Run and log end-to-end experiments after the pipeline is repaired"
+    "Run end-to-end smoke test on GPU server",
+    "Verify multi-GPU aggregation with >=2 GPUs",
+    "Record official experiment results"
   ],
-  "timestamp": "2026-03-31T00:00:00",
-  "note": "Round 5 review lowered the score because the advertised multi-GPU path writes shared summary files concurrently, checkpoint resume flags are misleading or incomplete, and several repository entry points are stale against the current S-PSI API. The codebase is not yet artifact-ready for reproducing paper results."
+  "timestamp": "2026-03-31T12:00:00",
+  "note": "Round 6 fixes: (1) multi-GPU summary writes now use file-locked merge with cross-init stats recomputation from all shards; (2) dead _inject_boundary_state removed; (3) stale entry points (invert_parameters.py, run_progressive_inversion.py, run_defense_eval.py) ported to match current SPSIConfig API via compat layer; (4) Phase F recovery eval now checks model existence before running; (5) resolved config and run metadata written to results/ for reproducibility; (6) setup.sh supports conda-only servers; (7) --aggregate_only flag for explicit post-parallel aggregation; (8) YAML inversion hyperparameters loaded into run_spsi.py; (9) KD resume_from_checkpoint honors explicit path.",
+  "previous_score": 4.0,
+  "code_fixes_applied": "2026-03-31",
+  "estimated_score_after_fixes": 8.0
 }

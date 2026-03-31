@@ -49,7 +49,7 @@ def setup_logging():
     )
 
 
-def build_query_pool(tokenizer, pool_size: int, max_seq_len: int, seed: int = 42):
+def build_query_pool(tokenizer, pool_size: int, max_seq_len: int, seed: int = 42, allow_synthetic: bool = False):
     """Build query input_ids from WikiText or random tokens."""
     input_ids_list = []
     try:
@@ -68,10 +68,19 @@ def build_query_pool(tokenizer, pool_size: int, max_seq_len: int, seed: int = 42
             )
             input_ids_list.append(tokens["input_ids"].squeeze(0))
     except Exception as e:
-        logger.warning("Dataset load failed: %s. Using random tokens.", e)
+        if not allow_synthetic:
+            raise RuntimeError(
+                f"Dataset load failed: {e}. Use --allow_synthetic to fall back to random tokens."
+            ) from e
+        logger.warning("Dataset load failed: %s. Falling back to random tokens (--allow_synthetic).", e)
 
     remaining = pool_size - len(input_ids_list)
     if remaining > 0:
+        if not allow_synthetic:
+            raise RuntimeError(
+                f"Only {len(input_ids_list)}/{pool_size} queries from dataset. "
+                "Use --allow_synthetic to pad with random tokens."
+            )
         rng = torch.Generator().manual_seed(seed)
         random_ids = torch.randint(
             3, tokenizer.vocab_size, (remaining, max_seq_len), generator=rng
@@ -134,7 +143,66 @@ def parse_args():
                         help="Seed for wrong teacher random init")
     parser.add_argument("--heldout_fraction", type=float, default=0.2,
                         help="Fraction of query pool to hold out for validation")
+    parser.add_argument("--allow_synthetic", action="store_true",
+                        help="Allow fallback to random tokens if dataset load fails")
+    parser.add_argument("--aggregate_only", action="store_true",
+                        help="Skip training; just aggregate existing per-init results")
     return parser.parse_args()
+
+
+def aggregate_results(args):
+    """Read per-init summary files and rebuild regime/experiment summaries.
+
+    Called via --aggregate_only after parallel multi-GPU workers finish.
+    """
+    output_dir = Path(args.output_dir)
+    regimes = []
+    if args.regime in ("oracle", "both"):
+        regimes.append("oracle")
+    if args.regime in ("pure_logits", "both"):
+        regimes.append("pure_logits")
+
+    all_results = {}
+    for regime in regimes:
+        regime_dir = output_dir / f"regime_{regime}"
+        if not regime_dir.is_dir():
+            logger.warning("Regime dir not found: %s", regime_dir)
+            continue
+
+        per_init = []
+        for init_path in sorted(regime_dir.glob("init_*/spsi_summary.json")):
+            try:
+                with open(init_path) as f:
+                    summary = json.load(f)
+                per_init.append({
+                    "init_seed": summary.get("init_seed", -1),
+                    "blocks": summary.get("blocks", []),
+                })
+            except (json.JSONDecodeError, IOError) as exc:
+                logger.warning("Skipping %s: %s", init_path, exc)
+
+        if not per_init:
+            logger.warning("No init summaries found in %s", regime_dir)
+            continue
+
+        cross_stats = _recompute_cross_init_stats_from_summary(per_init)
+        regime_data = {"per_init": per_init, "cross_init_stats": cross_stats}
+        all_results[regime] = regime_data
+
+        with open(regime_dir / "regime_summary.json", "w") as f:
+            json.dump(regime_data, f, indent=2)
+        logger.info("Aggregated %d inits for regime=%s", len(per_init), regime)
+
+    experiment_summary = {
+        "model": args.model_name,
+        "regimes": list(all_results.keys()),
+        "num_inits": len(next(iter(all_results.values()), {}).get("per_init", [])),
+        "results": all_results,
+    }
+    with open(output_dir / "experiment_summary.json", "w") as f:
+        json.dump(experiment_summary, f, indent=2)
+
+    logger.info("Aggregation complete → %s/experiment_summary.json", output_dir)
 
 
 def main():
@@ -142,16 +210,46 @@ def main():
     setup_logging()
     torch.manual_seed(args.seed)
 
+    if args.aggregate_only:
+        aggregate_results(args)
+        return
+
     if args.config and Path(args.config).exists():
         with open(args.config) as f:
             config_yaml = yaml.safe_load(f)
         args.model_name = config_yaml.get("teacher", {}).get(
             "model_name", args.model_name
         )
+        inv_cfg = config_yaml.get("inversion", {})
+        if inv_cfg.get("query_budget") and not any("--query_budget" in a for a in sys.argv):
+            args.query_budget = inv_cfg["query_budget"]
+        if inv_cfg.get("max_steps_per_block") and not any("--max_steps" in a for a in sys.argv):
+            args.max_steps = inv_cfg["max_steps_per_block"]
+        if inv_cfg.get("beta") is not None and not any("--beta" in a for a in sys.argv):
+            args.beta = inv_cfg["beta"]
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    resolved_config = {
+        "model_name": args.model_name,
+        "regime": args.regime,
+        "num_inits": args.num_inits,
+        "num_suffix_blocks": args.num_suffix_blocks,
+        "query_budget": args.query_budget,
+        "pool_size": args.pool_size,
+        "max_seq_len": args.max_seq_len,
+        "batch_size": args.batch_size,
+        "beta": args.beta,
+        "max_steps": args.max_steps,
+        "seed": args.seed,
+        "init_offset": args.init_offset,
+        "heldout_fraction": args.heldout_fraction,
+        "allow_synthetic": args.allow_synthetic,
+    }
+    with open(output_dir / "resolved_args.json", "w") as f:
+        json.dump(resolved_config, f, indent=2)
 
     logger.info("=== S-PSI: Sensitivity-Guided Progressive Suffix Inversion ===")
     logger.info("Model: %s", args.model_name)
@@ -176,7 +274,7 @@ def main():
 
     logger.info("Building query pool (%d inputs, max_len=%d)...",
                 args.pool_size, args.max_seq_len)
-    full_query_ids = build_query_pool(tokenizer, args.pool_size, args.max_seq_len, args.seed)
+    full_query_ids = build_query_pool(tokenizer, args.pool_size, args.max_seq_len, args.seed, allow_synthetic=args.allow_synthetic)
 
     n_total = len(full_query_ids)
     n_heldout = int(n_total * args.heldout_fraction)
@@ -304,6 +402,7 @@ def main():
                 ground_truth=ground_truth,
                 output_dir=init_dir,
                 init_seed=init_seed,
+                resume_dir=args.resume_from,
             )
 
             recovered_params = {
@@ -385,8 +484,11 @@ def main():
             "cross_init_stats": cross_init,
         }
 
-        with open(regime_dir / "regime_summary.json", "w") as f:
-            json.dump(all_results[regime], f, indent=2)
+        _locked_json_write(
+            regime_dir / "regime_summary.json",
+            all_results[regime],
+            merge_fn=_merge_per_init,
+        )
 
     if args.wrong_teacher:
         logger.info("\n=== Wrong-Teacher Falsification Control ===")
@@ -474,19 +576,19 @@ def main():
         with open(output_dir / "wrong_teacher_control.json", "w") as f:
             json.dump(wrong_results, f, indent=2)
 
-    with open(output_dir / "experiment_summary.json", "w") as f:
-        json.dump(
-            {
-                "model": args.model_name,
-                "regimes": list(k for k in all_results if k != "wrong_teacher_control"),
-                "num_inits": args.num_inits,
-                "num_suffix_blocks": args.num_suffix_blocks,
-                "beta": args.beta,
-                "heldout_fraction": args.heldout_fraction,
-                "results": all_results,
-            },
-            f, indent=2,
-        )
+    _locked_json_write(
+        output_dir / "experiment_summary.json",
+        {
+            "model": args.model_name,
+            "regimes": list(k for k in all_results if k != "wrong_teacher_control"),
+            "num_inits": args.num_inits,
+            "num_suffix_blocks": args.num_suffix_blocks,
+            "beta": args.beta,
+            "heldout_fraction": args.heldout_fraction,
+            "results": all_results,
+        },
+        merge_fn=_merge_experiment_summary,
+    )
 
     logger.info("\n=== S-PSI Experiment Complete ===")
     for regime, data in all_results.items():
@@ -599,6 +701,89 @@ def _compute_cross_init_stats(results: list) -> dict:
             "values": sims,
         }
     return stats
+
+
+def _recompute_cross_init_stats_from_summary(per_init_list: list) -> dict:
+    """Recompute cross-init stats from merged per-init JSON summaries.
+
+    Used by _merge_per_init to keep aggregate statistics correct when
+    multiple multi-GPU workers merge their results into the same file.
+    """
+    import numpy as np
+
+    block_sims: dict[str, list[float]] = {}
+    for entry in per_init_list:
+        for block in entry.get("blocks", []):
+            name = block.get("name", "unknown")
+            cos = block.get("mean_cosine", -1.0)
+            if cos >= 0:
+                block_sims.setdefault(name, []).append(cos)
+
+    stats = {}
+    for name, sims in block_sims.items():
+        stats[name] = {
+            "mean": float(np.mean(sims)),
+            "std": float(np.std(sims)),
+            "min": float(np.min(sims)),
+            "max": float(np.max(sims)),
+            "values": sims,
+        }
+    return stats
+
+
+def _locked_json_write(filepath, data, merge_fn=None):
+    """Write JSON with file locking for multi-GPU safety."""
+    import fcntl
+
+    filepath = Path(filepath)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    lock = filepath.with_suffix(filepath.suffix + ".lock")
+    with open(lock, "a") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            if merge_fn and filepath.exists():
+                try:
+                    with open(filepath) as f:
+                        existing = json.load(f)
+                    data = merge_fn(existing, data)
+                except (json.JSONDecodeError, IOError):
+                    pass
+            with open(filepath, "w") as f:
+                json.dump(data, f, indent=2)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def _merge_per_init(existing: dict, new: dict) -> dict:
+    """Merge per_init lists from different shards, dedup by init_seed, recompute stats."""
+    if "per_init" in existing and "per_init" in new:
+        seen = {e.get("init_seed") for e in existing["per_init"]}
+        for entry in new["per_init"]:
+            if entry.get("init_seed") not in seen:
+                existing["per_init"].append(entry)
+                seen.add(entry.get("init_seed"))
+        merged = existing["per_init"]
+    else:
+        merged = new.get("per_init", existing.get("per_init", []))
+
+    result = {**new, "per_init": merged}
+    result["cross_init_stats"] = _recompute_cross_init_stats_from_summary(merged)
+    return result
+
+
+def _merge_experiment_summary(existing: dict, new: dict) -> dict:
+    """Merge experiment_summary.json from different multi-GPU shards."""
+    if "results" not in existing:
+        return new
+    for regime, data in new.get("results", {}).items():
+        if regime in existing.get("results", {}) and regime != "wrong_teacher_control":
+            existing["results"][regime] = _merge_per_init(
+                existing["results"][regime], data
+            )
+        else:
+            existing.setdefault("results", {})[regime] = data
+    new["results"] = existing["results"]
+    return new
 
 
 if __name__ == "__main__":

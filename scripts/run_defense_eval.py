@@ -183,7 +183,6 @@ def run_inversion_trial(
         max_steps_per_layer=3000,
         convergence_threshold=1e-6,
         active_query_strategy="gradient_magnitude",
-        selection_batch=16,
     )
 
     inverter = LayerWiseInverter(student, teacher, inv_config, device)
@@ -207,7 +206,6 @@ def run_inversion_trial(
             {
                 "name": lr.layer_name,
                 "cosine_similarity": lr.cosine_similarity,
-                "l2_distance": lr.l2_distance,
                 "final_loss": lr.final_loss,
                 "converged": lr.converged,
             }
