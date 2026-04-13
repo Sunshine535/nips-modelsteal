@@ -19,6 +19,7 @@ import argparse
 import glob
 import json
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -191,7 +192,7 @@ def train_kd_student(
         if step < warmup_steps:
             return step / max(1, warmup_steps)
         progress = (step - warmup_steps) / max(1, total_opt_steps - warmup_steps)
-        return max(0.01, 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)).item()))
+        return max(0.01, 0.5 * (1 + torch.cos(torch.tensor(progress * math.pi)).item()))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -267,7 +268,6 @@ def train_kd_student(
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
-                torch.cuda.empty_cache()
 
                 if rank == 0 and global_step % 100 == 0:
                     logger.info(
@@ -296,6 +296,7 @@ def train_kd_student(
                 best_loss = avg_loss
                 model_to_save = student_model.module if hasattr(student_model, "module") else student_model
                 model_to_save.save_pretrained(output_dir / "best_student")
+                args._tokenizer.save_pretrained(output_dir / "best_student")
                 logger.info("Saved best student (loss=%.4f)", best_loss)
 
             save_training_checkpoint(
@@ -338,7 +339,7 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
-    parser.add_argument("--max_seq_len", type=int, default=512)
+    parser.add_argument("--max_seq_len", type=int, default=256)
     parser.add_argument("--output_dir", type=str, default="results/kd_baseline")
     parser.add_argument("--config", type=str, default="configs/inversion_config.yaml")
     parser.add_argument("--seed", type=int, default=42)
@@ -359,8 +360,12 @@ def main():
     if args.config and Path(args.config).exists():
         with open(args.config) as f:
             config = yaml.safe_load(f)
-        args.teacher_model = config.get("teacher", {}).get("model_name", args.teacher_model)
-        args.student_model = config.get("student", {}).get("model_name", args.student_model)
+        # Only override from YAML if the CLI arg was NOT explicitly provided
+        cli_explicit = {a.split("=")[0].lstrip("-") for a in sys.argv[1:] if a.startswith("--")}
+        if "teacher_model" not in cli_explicit:
+            args.teacher_model = config.get("teacher", {}).get("model_name", args.teacher_model)
+        if "student_model" not in cli_explicit:
+            args.student_model = config.get("student", {}).get("model_name", args.student_model)
 
     device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
 
@@ -370,6 +375,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.teacher_model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    args._tokenizer = tokenizer
 
     if rank == 0:
         num_queries = args.query_budget

@@ -36,7 +36,7 @@ from src.parameter_inverter import (
     TeacherCache,
     run_spsi,
 )
-from src.permutation_alignment import compute_aligned_cosine
+from src.permutation_alignment import compute_aligned_cosine, compute_lm_head_aligned_cosine
 
 logger = logging.getLogger(__name__)
 
@@ -91,13 +91,59 @@ def build_query_pool(tokenizer, pool_size: int, max_seq_len: int, seed: int = 42
     return torch.stack(input_ids_list[:pool_size])
 
 
+def _untie_lm_head(student: torch.nn.Module):
+    """If lm_head shares weight with embed_tokens (tied embeddings), untie them.
+
+    After untying, lm_head.weight is an independent parameter that can be
+    randomized without corrupting the embedding layer.  The embedding keeps
+    the pretrained weights so that the student prefix still produces
+    meaningful hidden states (critical for pure_logits regime and early-block
+    oracle recovery).
+    """
+    lm_head = getattr(student, "lm_head", None)
+    embed = None
+    # Locate embedding: Qwen2 stores it at model.embed_tokens
+    if hasattr(student, "model") and hasattr(student.model, "embed_tokens"):
+        embed = student.model.embed_tokens
+    elif hasattr(student, "transformer") and hasattr(student.transformer, "wte"):
+        embed = student.transformer.wte  # GPT-2 style
+
+    if lm_head is None or embed is None:
+        return False
+
+    if lm_head.weight.data_ptr() == embed.weight.data_ptr():
+        # Create an independent copy for lm_head
+        lm_head.weight = torch.nn.Parameter(
+            lm_head.weight.data.clone(),
+            requires_grad=lm_head.weight.requires_grad,
+        )
+        # Also update the config so downstream code knows weights are untied
+        if hasattr(student, "config"):
+            student.config.tie_word_embeddings = False
+        logging.info(
+            "Untied lm_head from embed_tokens (was shared). "
+            "embed_tokens keeps pretrained weights."
+        )
+        return True
+    return False
+
+
 def randomize_suffix(
     student: torch.nn.Module,
     num_blocks: int,
     num_suffix_blocks: int,
     include_lm_head: bool = True,
 ):
-    """Re-initialize suffix block parameters (and optionally lm_head)."""
+    """Re-initialize suffix block parameters (and optionally lm_head).
+
+    If the model has tied embeddings (lm_head.weight == embed_tokens.weight),
+    we first untie them so that randomizing lm_head does not corrupt the
+    embedding layer.
+    """
+    # --- Handle tied embeddings BEFORE any randomization ---
+    if include_lm_head:
+        _untie_lm_head(student)
+
     last_block = num_blocks - 1
     target_blocks = set(range(last_block - num_suffix_blocks + 1, last_block + 1))
 
@@ -113,7 +159,12 @@ def randomize_suffix(
             if param.dim() >= 2:
                 torch.nn.init.kaiming_uniform_(param)
             else:
-                torch.nn.init.zeros_(param)
+                # RMSNorm/LayerNorm weights are multiplicative scales — init to 1
+                # Biases init to 0
+                if "layernorm" in name.lower() or "rmsnorm" in name.lower() or "norm" in name.lower():
+                    torch.nn.init.ones_(param)
+                else:
+                    torch.nn.init.zeros_(param)
 
 
 def parse_args():
@@ -128,9 +179,27 @@ def parse_args():
     parser.add_argument("--pool_size", type=int, default=10_000)
     parser.add_argument("--max_seq_len", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--alpha", type=float, default=1.0,
+                        help="Weight for logit loss")
     parser.add_argument("--beta", type=float, default=0.1,
                         help="Weight for sensitivity loss (0 = ablation)")
+    parser.add_argument("--gamma", type=float, default=1e-5,
+                        help="Weight for regularization loss")
+    parser.add_argument("--learning_rate", type=float, default=1e-4,
+                        help="Learning rate for block inversion")
+    parser.add_argument("--lm_head_lr", type=float, default=1e-3,
+                        help="Learning rate for lm_head inversion")
+    parser.add_argument("--lm_head_steps", type=int, default=5000,
+                        help="Number of steps for lm_head inversion")
     parser.add_argument("--max_steps", type=int, default=10_000)
+    parser.add_argument("--convergence_threshold", type=float, default=1e-7,
+                        help="Loss convergence threshold for early stopping")
+    parser.add_argument("--patience", type=int, default=500,
+                        help="Patience steps for early stopping")
+    parser.add_argument("--num_perturbation_positions", type=int, default=4,
+                        help="Number of positions to perturb for sensitivity loss")
+    parser.add_argument("--num_replacement_tokens", type=int, default=2,
+                        help="Number of replacement tokens per perturbed position")
     parser.add_argument("--output_dir", type=str, default="results/spsi")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--init_offset", type=int, default=0,
@@ -145,6 +214,21 @@ def parse_args():
                         help="Fraction of query pool to hold out for validation")
     parser.add_argument("--allow_synthetic", action="store_true",
                         help="Allow fallback to random tokens if dataset load fails")
+    parser.add_argument("--init_method", type=str, default="random",
+                        choices=["random", "alg_clean", "alg_aug"],
+                        help="Initialization method: random, alg_clean (logit-only), alg_aug (logit+sensitivity)")
+    parser.add_argument("--init_num_probes", type=int, default=64)
+    parser.add_argument("--init_truncation_rank", type=int, default=32)
+    parser.add_argument("--init_ridge", type=float, default=1e-4)
+    parser.add_argument("--init_step_scale", type=float, default=1.0)
+    parser.add_argument("--init_query_subsample", type=int, default=256)
+    parser.add_argument("--gramian_num_probes", type=int, default=64)
+    parser.add_argument("--gramian_query_subsample", type=int, default=256)
+    parser.add_argument("--gramian_project_gauge", action="store_true", default=True)
+    parser.add_argument("--no_gramian_project_gauge", dest="gramian_project_gauge", action="store_false")
+    parser.add_argument("--save_gramian_metrics", action="store_true", default=False)
+    parser.add_argument("--logit_suffix_positions", type=int, default=8,
+                        help="Only cache last K token-position logits (0=all). Reduces memory ~seq_len/K times.")
     parser.add_argument("--aggregate_only", action="store_true",
                         help="Skip training; just aggregate existing per-init results")
     return parser.parse_args()
@@ -217,16 +301,30 @@ def main():
     if args.config and Path(args.config).exists():
         with open(args.config) as f:
             config_yaml = yaml.safe_load(f)
-        args.model_name = config_yaml.get("teacher", {}).get(
-            "model_name", args.model_name
-        )
+        if not any("--model_name" in a for a in sys.argv):
+            args.model_name = config_yaml.get("teacher", {}).get(
+                "model_name", args.model_name
+            )
         inv_cfg = config_yaml.get("inversion", {})
-        if inv_cfg.get("query_budget") and not any("--query_budget" in a for a in sys.argv):
-            args.query_budget = inv_cfg["query_budget"]
-        if inv_cfg.get("max_steps_per_block") and not any("--max_steps" in a for a in sys.argv):
-            args.max_steps = inv_cfg["max_steps_per_block"]
-        if inv_cfg.get("beta") is not None and not any("--beta" in a for a in sys.argv):
-            args.beta = inv_cfg["beta"]
+        # Helper: override arg from YAML only if CLI arg was NOT explicitly passed
+        def _yaml_override(yaml_key, attr_name, cli_flag=None):
+            if cli_flag is None:
+                cli_flag = f"--{attr_name}"
+            if yaml_key in inv_cfg and inv_cfg[yaml_key] is not None and not any(cli_flag in a for a in sys.argv):
+                setattr(args, attr_name, inv_cfg[yaml_key])
+        _yaml_override("query_budget", "query_budget")
+        _yaml_override("max_steps_per_block", "max_steps", "--max_steps")
+        _yaml_override("beta", "beta")
+        _yaml_override("alpha", "alpha")
+        _yaml_override("gamma", "gamma")
+        _yaml_override("learning_rate", "learning_rate")
+        _yaml_override("lm_head_lr", "lm_head_lr")
+        _yaml_override("lm_head_steps", "lm_head_steps")
+        _yaml_override("convergence_threshold", "convergence_threshold")
+        _yaml_override("patience", "patience")
+        _yaml_override("batch_size", "batch_size")
+        _yaml_override("num_perturbation_positions", "num_perturbation_positions")
+        _yaml_override("num_replacement_tokens", "num_replacement_tokens")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     output_dir = Path(args.output_dir)
@@ -241,12 +339,32 @@ def main():
         "pool_size": args.pool_size,
         "max_seq_len": args.max_seq_len,
         "batch_size": args.batch_size,
+        "alpha": args.alpha,
         "beta": args.beta,
+        "gamma": args.gamma,
+        "learning_rate": args.learning_rate,
+        "lm_head_lr": args.lm_head_lr,
+        "lm_head_steps": args.lm_head_steps,
         "max_steps": args.max_steps,
+        "convergence_threshold": args.convergence_threshold,
+        "patience": args.patience,
+        "num_perturbation_positions": args.num_perturbation_positions,
+        "num_replacement_tokens": args.num_replacement_tokens,
         "seed": args.seed,
         "init_offset": args.init_offset,
         "heldout_fraction": args.heldout_fraction,
         "allow_synthetic": args.allow_synthetic,
+        "init_method": args.init_method,
+        "init_num_probes": args.init_num_probes,
+        "init_truncation_rank": args.init_truncation_rank,
+        "init_ridge": args.init_ridge,
+        "init_step_scale": args.init_step_scale,
+        "init_query_subsample": args.init_query_subsample,
+        "gramian_num_probes": args.gramian_num_probes,
+        "gramian_query_subsample": args.gramian_query_subsample,
+        "gramian_project_gauge": args.gramian_project_gauge,
+        "save_gramian_metrics": args.save_gramian_metrics,
+        "logit_suffix_positions": args.logit_suffix_positions,
     }
     with open(output_dir / "resolved_args.json", "w") as f:
         json.dump(resolved_config, f, indent=2)
@@ -271,6 +389,12 @@ def main():
         name: param.data.cpu().clone()
         for name, param in teacher_model.named_parameters()
     }
+    # If teacher has tied embeddings, lm_head.weight is not in named_parameters().
+    # Add it explicitly so that untied student's lm_head.weight can be compared.
+    if getattr(teacher_model.config, "tie_word_embeddings", False):
+        lm_head = getattr(teacher_model, "lm_head", None)
+        if lm_head is not None and "lm_head.weight" not in ground_truth:
+            ground_truth["lm_head.weight"] = lm_head.weight.data.cpu().clone()
 
     logger.info("Building query pool (%d inputs, max_len=%d)...",
                 args.pool_size, args.max_seq_len)
@@ -302,12 +426,30 @@ def main():
     config = SPSIConfig(
         query_budget=args.query_budget,
         batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        lm_head_lr=args.lm_head_lr,
+        lm_head_steps=args.lm_head_steps,
         max_steps_per_block=args.max_steps,
-        max_seq_len=args.max_seq_len,
+        convergence_threshold=args.convergence_threshold,
+        patience=args.patience,
+        alpha=args.alpha,
         beta=args.beta,
+        gamma=args.gamma,
+        num_perturbation_positions=args.num_perturbation_positions,
+        num_replacement_tokens=args.num_replacement_tokens,
+        max_seq_len=args.max_seq_len,
         seed=args.seed,
-        num_perturbation_positions=4,
-        num_replacement_tokens=2,
+        init_method=args.init_method,
+        init_num_probes=args.init_num_probes,
+        init_truncation_rank=args.init_truncation_rank,
+        init_ridge=args.init_ridge,
+        init_step_scale=args.init_step_scale,
+        init_query_subsample=args.init_query_subsample,
+        gramian_num_probes=args.gramian_num_probes,
+        gramian_query_subsample=args.gramian_query_subsample,
+        gramian_project_gauge=args.gramian_project_gauge,
+        save_gramian_metrics=args.save_gramian_metrics,
+        logit_suffix_positions=args.logit_suffix_positions,
     )
 
     teacher_bb = BlackBoxTeacher(model=teacher_model, device=device)
@@ -377,6 +519,10 @@ def main():
                     include_lm_head=True,
                 )
             else:
+                # Pure-logits: reset ALL parameters from scratch.
+                # Untie lm_head first so that embedding and lm_head can be
+                # optimized independently during recovery.
+                _untie_lm_head(student)
                 for name, m in student.named_modules():
                     if hasattr(m, "reset_parameters") and isinstance(
                         m, (torch.nn.Linear, torch.nn.Embedding)
@@ -389,8 +535,12 @@ def main():
                         elif "bias" in name:
                             torch.nn.init.zeros_(param)
 
-            if hasattr(student, "gradient_checkpointing_enable"):
-                student.gradient_checkpointing_enable()
+            # NOTE: gradient checkpointing is DISABLED because it conflicts with
+            # _BoundaryInjectionHook (oracle regime) — the recomputed forward pass
+            # produces different tensor metadata when boundary states are injected.
+            # For 0.8B models on A100-80GB, memory is sufficient without it.
+            if hasattr(student, "gradient_checkpointing_disable"):
+                student.gradient_checkpointing_disable()
 
             result = run_spsi(
                 student=student,
@@ -424,17 +574,39 @@ def main():
                         if aligned:
                             br.mean_cosine = sum(aligned.values()) / len(aligned)
 
+            # lm_head evaluation with Procrustes rotation alignment
+            lm_head_alignment = compute_lm_head_aligned_cosine(
+                recovered_params, ground_truth, lm_head_key="lm_head.weight",
+            )
+            if lm_head_alignment:
+                for br in result.block_results:
+                    if br.block_name == "lm_head":
+                        br.per_matrix_cosine = {
+                            "procrustes": lm_head_alignment,
+                        }
+                        br.mean_cosine = lm_head_alignment.get(
+                            "aligned_cosine", br.mean_cosine
+                        )
+                        logger.info(
+                            "lm_head alignment: raw=%.4f, aligned=%.4f",
+                            lm_head_alignment.get("raw_cosine", 0),
+                            lm_head_alignment.get("aligned_cosine", 0),
+                        )
+                        break
+
             train_metrics = _compute_heldout_loss(
                 student, teacher_bb,
                 query_ids[:min(len(heldout_ids), len(query_ids))],
                 device,
                 num_pert_positions=config.num_perturbation_positions,
                 num_pert_tokens=config.num_replacement_tokens,
+                logit_suffix_k=config.logit_suffix_positions,
             )
             heldout_metrics = _compute_heldout_loss(
                 student, teacher_bb, heldout_ids, device,
                 num_pert_positions=config.num_perturbation_positions,
                 num_pert_tokens=config.num_replacement_tokens,
+                logit_suffix_k=config.logit_suffix_positions,
             )
 
             generalization_report = {
@@ -625,6 +797,7 @@ def _compute_heldout_loss(
     device: str,
     num_pert_positions: int = 4,
     num_pert_tokens: int = 2,
+    logit_suffix_k: int = 0,
 ) -> dict:
     """Compute train-comparable losses on held-out queries.
 
@@ -640,17 +813,25 @@ def _compute_heldout_loss(
     n = 0
     rng = torch.Generator().manual_seed(12345)
 
-    for start in range(0, len(heldout_ids), 16):
-        batch = heldout_ids[start : start + 16].to(device)
+    # Use small batch size to avoid OOM on large vocab models
+    eval_batch_size = min(4, len(heldout_ids))
+    K = logit_suffix_k  # from parameter
+
+    for start in range(0, len(heldout_ids), eval_batch_size):
+        batch = heldout_ids[start : start + eval_batch_size].to(device)
         bsz = batch.size(0)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             z_s = student(batch).logits
-        z_t = teacher.query(batch)
+            z_t = teacher.query(batch)
+            if K > 0:
+                z_s = z_s[:, -K:, :]
+                z_t = z_t[:, -K:, :]
         total_logit_loss += F.mse_loss(z_s.float(), z_t.float()).item() * bsz
+        del z_t  # free GPU memory immediately
 
         seq_len = batch.size(1)
         positions = torch.randint(0, seq_len, (bsz, num_pert_positions), generator=rng)
-        replacements = torch.randint(3, 100, (bsz, num_pert_positions, num_pert_tokens), generator=rng)
+        replacements = torch.randint(3, 53, (bsz, num_pert_positions, num_pert_tokens), generator=rng)
 
         pert_list = []
         for b in range(bsz):
@@ -662,16 +843,38 @@ def _compute_heldout_loss(
                     pert_list.append(x_prime)
 
         if pert_list:
-            pert_batch = torch.stack(pert_list).to(device)
             pert_per = num_pert_positions * num_pert_tokens
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                z_s_pert = student(pert_batch).logits
-            z_t_pert = teacher.query(pert_batch)
+            # Process perturbations in sub-batches to avoid OOM
+            pert_all = torch.stack(pert_list).to(device)
+            z_s_pert_parts, z_t_pert_parts = [], []
+            for ps in range(0, len(pert_all), eval_batch_size):
+                pb = pert_all[ps : ps + eval_batch_size]
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    zsp = student(pb).logits
+                    ztp = teacher.query(pb)
+                    if K > 0:
+                        zsp = zsp[:, -K:, :]
+                        ztp = ztp[:, -K:, :]
+                z_s_pert_parts.append(zsp.float().cpu())
+                z_t_pert_parts.append(ztp.float().cpu())
+            z_s_pert = torch.cat(z_s_pert_parts)
+            z_t_pert = torch.cat(z_t_pert_parts)
 
-            delta_s = z_s_pert.float() - z_s.float().repeat_interleave(pert_per, dim=0)
-            delta_t = z_t_pert.float() - z_t.float().repeat_interleave(pert_per, dim=0)
+            z_s_ref = z_s.float().cpu().repeat_interleave(pert_per, dim=0)
+            z_t_ref = z_t_pert  # already teacher's perturbed
+            # Recompute clean teacher for delta (already freed, re-query)
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                z_t_clean = teacher.query(batch)
+                if K > 0:
+                    z_t_clean = z_t_clean[:, -K:, :]
+            z_t_clean_ref = z_t_clean.float().cpu().repeat_interleave(pert_per, dim=0)
+            delta_s = z_s_pert - z_s_ref
+            delta_t = z_t_pert - z_t_clean_ref
             total_sens_loss += F.mse_loss(delta_s, delta_t).item() * bsz
+            del z_s_pert, z_t_pert, z_s_ref, z_t_clean_ref, delta_s, delta_t, pert_all
 
+        del z_s
+        torch.cuda.empty_cache()
         n += bsz
 
     return {

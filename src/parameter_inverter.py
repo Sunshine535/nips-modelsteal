@@ -48,10 +48,23 @@ class SPSIConfig:
     num_replacement_tokens: int = 2
     max_seq_len: int = 256
 
-    suffix_refine_enabled: bool = False
-    suffix_refine_interval: int = 2000
-    suffix_refine_steps: int = 200
-    suffix_refine_lr: float = 1e-5
+    # Algebraic initialization
+    init_method: str = "random"   # random | alg_clean | alg_aug
+    init_num_probes: int = 64
+    init_truncation_rank: int = 32
+    init_ridge: float = 1e-4
+    init_step_scale: float = 1.0
+    init_query_subsample: int = 256
+
+    # Gramian diagnostics
+    gramian_num_probes: int = 64
+    gramian_query_subsample: int = 256
+    gramian_project_gauge: bool = True
+    save_gramian_metrics: bool = False
+
+    # Cache memory optimization: only store logits for last K token positions
+    # Set to 0 to store all positions (WARNING: huge memory for large vocab)
+    logit_suffix_positions: int = 8
 
     log_every: int = 100
     save_every: int = 2000
@@ -69,6 +82,9 @@ class BlockResult:
     num_steps: int = 0
     num_queries: int = 0
     converged: bool = False
+    init_method: str = "random"
+    init_metrics: dict = field(default_factory=dict)
+    observability_metrics: dict = field(default_factory=dict)
 
     @property
     def cosine_similarity(self) -> float:
@@ -163,14 +179,18 @@ class TeacherCache:
         logger.info("Building teacher cache for %d inputs...", len(input_ids))
         self.input_ids = input_ids
         vocab_size = teacher.model.config.vocab_size
+        K = config.logit_suffix_positions  # 0 = store all positions
 
         clean_logits_list = []
         for start in range(0, len(input_ids), 32):
             batch = input_ids[start : start + 32]
             logits = teacher.query(batch)
+            if K > 0:
+                logits = logits[:, -K:, :]  # only last K positions
             clean_logits_list.append(logits.cpu())
         self.clean_logits = torch.cat(clean_logits_list)
-        logger.info("  Clean logits cached: %s", self.clean_logits.shape)
+        self._logit_suffix_k = K
+        logger.info("  Clean logits cached: %s (suffix_positions=%s)", self.clean_logits.shape, K if K > 0 else "ALL")
 
         rng = torch.Generator().manual_seed(config.seed)
         P = config.num_perturbation_positions
@@ -209,6 +229,8 @@ class TeacherCache:
                 for s in range(0, len(stacked), 32):
                     chunk = stacked[s : s + 32]
                     pl = teacher.query(chunk)
+                    if K > 0:
+                        pl = pl[:, -K:, :]  # match clean logits truncation
                     all_perturbed_logits.append(pl.cpu())
 
         self.perturbed_input_ids = torch.cat(all_perturbed)
@@ -311,7 +333,12 @@ def compute_per_matrix_cosine(
     ground_truth: dict[str, torch.Tensor],
     param_names: list[str],
 ) -> dict[str, float]:
-    """Compute cosine similarity per weight matrix."""
+    """Compute cosine similarity per weight matrix.
+
+    Keys are abbreviated parameter names (e.g. "q_proj.weight",
+    "input_layernorm.weight") to keep JSON readable while avoiding
+    collisions between different matrices in the same block.
+    """
     metrics = {}
     for name in param_names:
         if name not in ground_truth:
@@ -325,7 +352,10 @@ def compute_per_matrix_cosine(
                 sim = F.cosine_similarity(
                     pred.unsqueeze(0), gt.unsqueeze(0)
                 ).item()
-                short = name.split(".")[-1]
+                # Use last 2 segments (e.g. "q_proj.weight") to avoid
+                # key collisions. For lm_head it stays as "weight".
+                parts = name.split(".")
+                short = ".".join(parts[-2:]) if len(parts) >= 2 else name
                 metrics[short] = sim
                 break
     return metrics
@@ -392,6 +422,7 @@ def invert_block(
     boundary_layer_idx: Optional[int] = None,
     is_lm_head: bool = False,
     checkpoint_dir: Optional[str] = None,
+    checkpoint_load_dir: Optional[str] = None,
     use_oracle_boundary: bool = False,
     query_budget_remaining: Optional[int] = None,
 ) -> BlockResult:
@@ -426,9 +457,10 @@ def invert_block(
     total_queries = 0
     start_step = 0
 
-    if checkpoint_dir:
+    _load_dir = checkpoint_load_dir or checkpoint_dir
+    if _load_dir:
         import glob
-        ckpt_pattern = str(Path(checkpoint_dir) / f"ckpt_{block_label}_step*.pt")
+        ckpt_pattern = str(Path(_load_dir) / f"ckpt_{block_label}_step*.pt")
         existing = sorted(glob.glob(ckpt_pattern), key=lambda x: int(x.split("step")[-1].split(".")[0]))
         if existing:
             ckpt = torch.load(existing[-1], map_location=device, weights_only=False)
@@ -437,9 +469,10 @@ def invert_block(
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             start_step = ckpt.get("step", 0)
             best_loss = ckpt.get("best_loss", float("inf"))
+            no_improve = ckpt.get("no_improve", 0)
             logger.info(
-                "Resumed %s from step %d (best_loss=%.6f)",
-                block_label, start_step, best_loss,
+                "Resumed %s from step %d (best_loss=%.6f, no_improve=%d)",
+                block_label, start_step, best_loss, no_improve,
             )
 
     P = config.num_perturbation_positions
@@ -452,6 +485,8 @@ def invert_block(
         and not is_lm_head
         and boundary_layer_idx in cache.boundary_states
     )
+
+    step = start_step - 1  # default in case loop never executes
 
     for step in range(start_step, max_steps):
         if query_budget_remaining is not None and total_queries >= query_budget_remaining:
@@ -482,6 +517,10 @@ def invert_block(
         with ctx_clean:
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 z_s = student(input_ids).logits
+                # Truncate student logits to match cached teacher logits
+                K = getattr(cache, '_logit_suffix_k', 0)
+                if K > 0:
+                    z_s = z_s[:, -K:, :]
                 loss_logit = F.mse_loss(z_s.float(), clean_logits_t.float())
 
         loss_sensitivity = torch.tensor(0.0, device=device)
@@ -496,6 +535,8 @@ def invert_block(
             with ctx_pert:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     z_s_pert = student(pert_ids).logits
+                    if K > 0:
+                        z_s_pert = z_s_pert[:, -K:, :]
             delta_s = z_s_pert.float() - z_s.detach().float().repeat_interleave(
                 pert_per_input, dim=0
             )
@@ -548,7 +589,8 @@ def invert_block(
 
         if checkpoint_dir and step > 0 and step % config.save_every == 0:
             _save_checkpoint(
-                checkpoint_dir, block_label, step, student, optimizer, best_loss
+                checkpoint_dir, block_label, step, student, optimizer, best_loss,
+                no_improve=no_improve,
             )
 
     per_matrix = {}
@@ -583,14 +625,15 @@ def run_spsi(
     """Run complete S-PSI pipeline."""
     result = SPSIResult(regime=regime, init_seed=init_seed)
     num_blocks = get_num_blocks(student)
-    ckpt_dir = str(Path(output_dir) / "checkpoints") if output_dir else None
+    ckpt_save_dir = str(Path(output_dir) / "checkpoints") if output_dir else None
+    ckpt_load_dir = None
     if resume_dir:
         candidate = Path(resume_dir) / "checkpoints"
         if candidate.is_dir():
-            ckpt_dir = str(candidate)
+            ckpt_load_dir = str(candidate)
         elif Path(resume_dir).is_dir():
-            ckpt_dir = resume_dir
-        logger.info("Resuming from checkpoint dir: %s", ckpt_dir)
+            ckpt_load_dir = resume_dir
+        logger.info("Resuming from checkpoint dir: %s", ckpt_load_dir)
     use_oracle = regime == "oracle"
     precompute_queries = teacher.query_count
     budget_remaining = config.query_budget - precompute_queries
@@ -605,7 +648,8 @@ def run_spsi(
         student, cache, config, lm_head_names,
         ground_truth=ground_truth,
         is_lm_head=True,
-        checkpoint_dir=ckpt_dir,
+        checkpoint_dir=ckpt_save_dir,
+        checkpoint_load_dir=ckpt_load_dir,
         use_oracle_boundary=False,
         query_budget_remaining=budget_remaining,
     )
@@ -630,15 +674,68 @@ def run_spsi(
         if not block_names:
             continue
 
+        block_label = f"block_{block_idx}"
+        boundary_idx = block_idx
+        param_names = block_names
+
         logger.info(
             "Phase %d: Block %d recovery (%d params, oracle=%s)",
             k + 1, block_idx, len(block_names), use_oracle,
         )
+
+        # --- Algebraic initialization (if configured) ---
+        if config.init_method != "random":
+            try:
+                from src.algebraic_init import algebraic_initialize_block, AlgebraicInitConfig
+                from src.symmetry_gauge import build_suffix_gauge_basis
+                from src.gramian import make_flat_param_spec
+
+                alg_config = AlgebraicInitConfig(
+                    num_probes=config.init_num_probes,
+                    truncation_rank=config.init_truncation_rank,
+                    ridge=config.init_ridge,
+                    step_scale=config.init_step_scale,
+                    query_subsample=config.init_query_subsample,
+                    include_sensitivity=(config.init_method == "alg_aug"),
+                    sensitivity_weight=config.beta,
+                    project_gauge=config.gramian_project_gauge,
+                    seed=init_seed if init_seed else config.seed,
+                )
+
+                gauge = None
+                if config.gramian_project_gauge:
+                    spec = make_flat_param_spec(student, param_names)
+                    gauge = build_suffix_gauge_basis(student, spec, [block_idx])
+
+                alg_result = algebraic_initialize_block(
+                    student=student,
+                    cache=cache,
+                    param_names=param_names,
+                    config=alg_config,
+                    spsi_config=config,
+                    boundary_layer_idx=boundary_idx if use_oracle else None,
+                    use_oracle_boundary=use_oracle,
+                    gauge_basis=gauge,
+                )
+                logger.info(
+                    "  Algebraic init for %s: predicted_decrease=%.4e, "
+                    "post_loss=%.4e, top_sv=%.4e, cond=%.1f",
+                    block_label,
+                    alg_result.predicted_loss_decrease,
+                    alg_result.post_init_loss,
+                    alg_result.singular_values[0].item() if len(alg_result.singular_values) > 0 else 0,
+                    (alg_result.singular_values[0] / alg_result.singular_values[-1]).item()
+                    if len(alg_result.singular_values) > 1 and alg_result.singular_values[-1] > 0 else float('inf'),
+                )
+            except Exception as e:
+                logger.warning("Algebraic init failed for %s: %s. Using random init.", block_label, e)
+
         br = invert_block(
             student, cache, config, block_names,
             ground_truth=ground_truth,
             boundary_layer_idx=block_idx,
-            checkpoint_dir=ckpt_dir,
+            checkpoint_dir=ckpt_save_dir,
+            checkpoint_load_dir=ckpt_load_dir,
             use_oracle_boundary=use_oracle,
             query_budget_remaining=budget_remaining,
         )
@@ -664,6 +761,7 @@ def _save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     best_loss: float,
+    no_improve: int = 0,
 ) -> None:
     path = Path(ckpt_dir)
     path.mkdir(parents=True, exist_ok=True)
@@ -674,6 +772,7 @@ def _save_checkpoint(
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "best_loss": best_loss,
+            "no_improve": no_improve,
         },
         path / f"ckpt_{block_label}_step{step}.pt",
     )

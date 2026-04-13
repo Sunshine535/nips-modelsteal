@@ -232,6 +232,79 @@ def full_block_alignment(
     return aligned
 
 
+def compute_lm_head_aligned_cosine(
+    recovered: dict[str, torch.Tensor],
+    teacher: dict[str, torch.Tensor],
+    lm_head_key: str = "lm_head.weight",
+) -> dict[str, float]:
+    """Compute lm_head cosine similarity with Procrustes rotation alignment.
+
+    The lm_head weight W ∈ R^{V×d} has a GL(d) rotation gauge symmetry:
+    if the last hidden state h is rotated by Q ∈ O(d), then W → W Q^T
+    preserves the output logits z = W h.
+
+    We find the optimal orthogonal Q* = argmin ||W_rec Q - W_tea||_F via
+    Procrustes: Q* = V U^T where W_tea^T W_rec = U Σ V^T (SVD).
+
+    Returns dict with keys: 'raw_cosine', 'aligned_cosine', 'procrustes_error'.
+    """
+    if lm_head_key not in recovered or lm_head_key not in teacher:
+        logger.warning("lm_head key '%s' not found in params.", lm_head_key)
+        return {}
+
+    W_rec = recovered[lm_head_key].float()  # [V, d]
+    W_tea = teacher[lm_head_key].float()    # [V, d]
+
+    if W_rec.shape != W_tea.shape:
+        logger.warning("lm_head shape mismatch: %s vs %s", W_rec.shape, W_tea.shape)
+        return {}
+
+    # Raw cosine (no alignment)
+    raw_cos = F.cosine_similarity(
+        W_rec.flatten().unsqueeze(0),
+        W_tea.flatten().unsqueeze(0),
+    ).item()
+
+    # Procrustes rotation alignment: find Q* = argmin ||W_rec Q - W_tea||_F
+    # Solution: Q* = V U^T where W_rec^T W_tea = U Σ V^T
+    M = W_rec.T @ W_tea  # [d, d]
+    try:
+        U, S, Vh = torch.linalg.svd(M)
+        Q_star = U @ Vh  # [d, d] orthogonal matrix
+
+        # Check for reflection (det = -1) → flip sign of last column
+        if torch.det(Q_star) < 0:
+            U[:, -1] *= -1
+            Q_star = U @ Vh
+
+        W_rec_aligned = W_rec @ Q_star  # [V, d]
+
+        aligned_cos = F.cosine_similarity(
+            W_rec_aligned.flatten().unsqueeze(0),
+            W_tea.flatten().unsqueeze(0),
+        ).item()
+
+        # Relative Frobenius error
+        proc_err = (W_rec_aligned - W_tea).norm().item() / (W_tea.norm().item() + 1e-12)
+
+        logger.info(
+            "lm_head Procrustes alignment: raw_cos=%.4f, aligned_cos=%.4f, "
+            "proc_err=%.4f, top singular values: %s",
+            raw_cos, aligned_cos, proc_err,
+            S[:5].tolist(),
+        )
+
+        return {
+            "raw_cosine": raw_cos,
+            "aligned_cosine": aligned_cos,
+            "procrustes_error": proc_err,
+            "top_singular_values": S[:10].tolist(),
+        }
+    except Exception as e:
+        logger.warning("Procrustes SVD failed: %s", e)
+        return {"raw_cosine": raw_cos}
+
+
 def compute_aligned_cosine(
     recovered: dict[str, torch.Tensor],
     teacher: dict[str, torch.Tensor],

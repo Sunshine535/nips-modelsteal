@@ -4,7 +4,7 @@ PROJ_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_NAME="nips-modelsteal"
 
 echo "============================================"
-echo " Environment Setup (PyTorch 2.10 + CUDA 12.8)"
+echo " Environment Setup (PyTorch 2.6.0 + CUDA 12.4)"
 echo "============================================"
 
 USE_CONDA=false
@@ -34,13 +34,13 @@ if [ "$USE_CONDA" = true ]; then
     eval "$(conda shell.bash hook)"
     conda activate "$CONDA_ENV"
 
-    echo "[3/5] Installing PyTorch 2.10.0 + CUDA 12.8 (conda) ..."
-    pip install "torch==2.10.0" "torchvision" "torchaudio" \
-        --index-url https://download.pytorch.org/whl/cu128
+    echo "[3/5] Installing PyTorch 2.6.0 + CUDA 12.4 (conda) ..."
+    pip install "torch==2.6.0" "torchvision" "torchaudio" \
+        --index-url https://download.pytorch.org/whl/cu124
 
     echo "[4/5] Installing project dependencies ..."
     pip install -r "$PROJ_DIR/requirements.txt" \
-        --extra-index-url https://download.pytorch.org/whl/cu128
+        --extra-index-url https://download.pytorch.org/whl/cu124
 
     echo "[5/5] Installing flash-attn (optional) ..."
     pip install flash-attn --no-build-isolation 2>/dev/null || echo "  flash-attn skipped (optional)"
@@ -57,13 +57,13 @@ else
     fi
     source "$VENV_DIR/bin/activate"
 
-    echo "[3/5] Installing PyTorch 2.10.0 + CUDA 12.8 ..."
-    uv pip install "torch==2.10.0" "torchvision" "torchaudio" \
-        --index-url https://download.pytorch.org/whl/cu128
+    echo "[3/5] Installing PyTorch 2.6.0 + CUDA 12.4 ..."
+    uv pip install "torch==2.6.0" "torchvision" "torchaudio" \
+        --index-url https://download.pytorch.org/whl/cu124
 
     echo "[4/5] Installing project dependencies ..."
     uv pip install -r "$PROJ_DIR/requirements.txt" \
-        --extra-index-url https://download.pytorch.org/whl/cu128 \
+        --extra-index-url https://download.pytorch.org/whl/cu124 \
         --index-strategy unsafe-best-match
 
     echo "[5/5] Installing flash-attn (optional) ..."

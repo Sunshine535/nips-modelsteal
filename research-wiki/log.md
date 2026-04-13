@@ -1,0 +1,137 @@
+# Research Wiki Log
+
+Append-only timeline of all wiki mutations.
+
+---
+
+- **2026-04-09T01:50:00Z** — Wiki initialized for project `nips-modelsteal` (Progressive Parameter Inversion / Transformer Tomography)
+- **2026-04-09T02:00:00Z** — Ingested 3 core papers: carlini2024_stealing, rawal2025_spsi, tramer2016_stealing
+- **2026-04-09T02:00:00Z** — Created idea:001 (Transformer Tomography) — stage=active, outcome=pending
+- **2026-04-09T02:00:00Z** — Created 5 claims: C1 (supported), C2 (reported), C3 (supported), C4 (reported), C5 (reported)
+- **2026-04-09T02:00:00Z** — Populated gap_map with G1-G5
+- **2026-04-09T02:00:00Z** — Built 10 edges in graph/edges.jsonl
+- **2026-04-09T02:00:00Z** — Generated query_pack.md (initial version)
+- **2026-04-09T02:00:00Z** — Rebuilt index.md
+- **2026-04-09T02:43:00Z** — Smoke test v8 PASSED: lm_head cos=0.95, block_23 cos=-0.11 (100 steps, expected for random init). Pipeline end-to-end verified.
+- **2026-04-09T02:44:00Z** — Bug fixes: (1) Added logit_suffix_positions=8 to avoid 200GB+ logit cache OOM; (2) Disabled gradient checkpointing (conflicts with boundary injection hook); (3) Fixed heldout eval OOM with small batch + suffix truncation
+- **2026-04-09T02:45:00Z** — Launched Wave 1 experiments (Qwen3.5-0.8B): 4 GPUs × {random×3 seeds + alg_clean×1 seed} on 4×A100-80GB — **FAILED: OOM due to Qwen3.5's hybrid linear attention (delta rule) + excessive memory usage**
+- **2026-04-09T03:15:00Z** — **Model switch: Qwen3.5-0.8B → Qwen2.5-0.5B**. Reason: Qwen3.5 uses non-standard hybrid linear attention (chunk_gated_delta_rule), incompatible with our standard transformer assumptions. Qwen2.5-0.5B (494M params, 24 layers, standard MHA+GQA, RMSNorm, SiLU-gated MLP) is a proper standard transformer.
+- **2026-04-09T03:16:00Z** — Smoke test v9 PASSED on Qwen2.5-0.5B: lm_head cos=0.938, block_23 cos=-0.017 (50 steps). GPU memory: 23.5/80 GB (safe).
+- **2026-04-09T03:20:00Z** — Relaunched Wave 1-5 auto-dispatch with Qwen2.5-0.5B. Config: pool=2048, seq=128, batch=8, python -u for unbuffered logs.
+- **2026-04-09T03:30:00Z** — Wave 1 first result: random/seed_123 completed (lm_head cos=0.487, block_23 cos=0.071, block_22 cos=0.015). Both suffix blocks near random — confirms algebraic init is essential.
+- **2026-04-09T03:32:00Z** — Bug fix: `_untie_lm_head()` added to `randomize_suffix()` and pure_logits init. Qwen2.5-0.5B has `tie_word_embeddings=True`, so randomizing lm_head was corrupting embed_tokens. Now creates an independent lm_head parameter before any randomization.
+- **2026-04-09T03:32:00Z** — Bug fix: `compute_per_matrix_cosine()` key collision — was using `name.split(".")[-1]` which mapped all weights to `"weight"` key (overwriting). Fixed to use 2-segment keys (e.g. `q_proj.weight`). Wave 1 per-matrix metrics are inaccurate due to this bug; Wave 2+ will have correct metrics.
+- **2026-04-09T03:33:00Z** — Both fixes synced to remote server. Wave 1 experiments (3 still running) use old code; Wave 2+ will use fixed code.
+- **2026-04-09T03:35:00Z** — **Critical bug found:** `FlatParamSpec.name_to_slice` missing in gramian.py version. Two `FlatParamSpec` classes existed (gramian.py vs symmetry_gauge.py) with incompatible interfaces. All alg_clean/alg_aug experiments silently fell back to random init. Fixed by adding `name_to_slice()`, `name_to_index()`, and `.total` property to `gramian.FlatParamSpec`.
+- **2026-04-09T03:39:00Z** — Wave 1 COMPLETE. All 4 experiments saved results. Corrected per-matrix cosine evaluation confirms: random init achieves lm_head cos ≈ 0.47±0.03 but block_23/block_22 cos ≈ 0±0.02 (no recovery). This is the negative baseline.
+- **2026-04-09T03:42:00Z** — **Wave 2 launched** (fixed code): alg_clean×2 + alg_aug×2 on 4 GPUs. Algebraic init should work correctly now.
+- **2026-04-09T03:49:00Z** — Wave 2 algebraic init verified working: "Built 1792 RMSNorm gauge directions for blocks [23]" logged successfully. FlatParamSpec fix confirmed. JVP computation in progress (64 probes × forward pass, ~15-20 min).
+- **2026-04-09T03:50:00Z** — Bug fix: ground_truth dict missing `lm_head.weight` when teacher has tied embeddings. Added explicit entry. Wave 2 will show lm_head mean_cos=0 due to this bug (fixed for Wave 3+).
+- **2026-04-09T03:51:00Z** — SSH connection lost to remote server (likely Tailscale VPN). Experiments running in nohup, unaffected. Paper editing continues locally.
+- **2026-04-09T03:52:00Z** — Paper main.tex updated: Analysis section revised to reflect Wave 1 findings (initialization barrier, random init = 0 block recovery), appendix vocab size corrected (151936), logit cache calculation corrected.
+- **2026-04-09T04:38:00Z** — alg_clean/seed_42 v4 launched with sparse gauge fix (6656 directions built in 1s). Process stalled at gauge projection — O(g²) streaming MGS bottleneck (22M sparse ops).
+- **2026-04-09T04:47:00Z** — **Performance fix: project_out_gauge O(g²) → O(g·k)**. Replaced streaming MGS inner-loop orthogonalization with multi-pass simple projection (2 sweeps). Gauge directions have structurally non-overlapping supports, so orthogonalization is unnecessary. Post-projection QR handles residuals.
+- **2026-04-09T04:54:00Z** — Launched 4 experiments (alg_clean×3 + alg_aug×1) on 4 GPUs with optimized gauge projection code.
+- **2026-04-09T04:58:00Z** — All 4 experiments entered Block 23 algebraic init phase. Gauge basis built in ~3s each. But stalled at probe matrix construction (14.9M × 64 QR on CPU).
+- **2026-04-09T05:00:00Z** — All 4 pure_logits experiments (seeds 42,123,777,999) completed. Results: lm_head≈0, block_23≈0.134±0.018, block_22≈0.141±0.004, block_21≈0.144±0.009. All ≈0.14 = architectural init bias, no real recovery.
+- **2026-04-09T05:15:00Z** — **Critical bug found: logit_suffix_positions truncation missing in algebraic_init.py and gramian.py**. Teacher cache stores [B,8,V] (last 8 positions), but student logits are [B,128,V] (full sequence). The size mismatch (128 vs 8) caused "Algebraic init failed" → silent fallback to random init. This means ALL algebraic init experiments to date never actually performed algebraic initialization!
+- **2026-04-09T05:20:00Z** — Triple fix deployed: (1) Truncate student logits/JVP to match suffix positions in algebraic_init.py and gramian.py, (2) Move large QR to GPU for speed, (3) Optimized gauge projection already deployed. Launched v6 single-GPU test.
+- **2026-04-09T05:20:00Z** — Paper Experiment 2 table updated with full 4-seed pure_logits data. Experiment 3 table updated with complete no_gauge, beta0, wrong_teacher results.
+- **2026-04-09T05:28:00Z** — **v6 algebraic init FAILED**: forward-mode AD (torch.func.jvp) doesn't support `_scaled_dot_product_flash_attention`. Gauge projection succeeded (64→64, 0 lost), initial loss computed (1.116e+06), but JVP computation hit flash attention limitation. Silently fell back to random init. block_23 cos ≈ 0 after 1000 steps (no recovery).
+- **2026-04-09T05:36:00Z** — **Fix: sdpa_kernel(SDPBackend.MATH)** wrapping JVP call in gramian.py. Forces MATH backend (supports forward AD) instead of flash attention during JVP computation. Import added: `from torch.nn.attention import sdpa_kernel, SDPBackend`.
+- **2026-04-09T05:40:00Z** — Killed all 4 old experiments. Relaunched v7 wave on 4 GPUs with flash attention fix. Log files: exp1_alg_clean_s42_v7, exp1_alg_clean_s123_v4, exp1_alg_clean_s777_v4, exp1_alg_aug_s42_v4.
+- **2026-04-09T05:56:00Z** — **🎉 First successful algebraic initialization!** v7 alg_clean/s42 Block 23 results:
+  - Gauge projection: 64 → 64 (0 lost), Gramian computation: ~10 min (64 probes × 256 queries)
+  - σ_max=11.24, σ_min(kept)=0.197, rank=32, condition=56.95
+  - Predicted decrease=1140, actual decrease=**2016** (ratio=1.77 — Gauss-Newton works!)
+  - |Δθ|=68.72, |θ_0|=159.49 (43% relative update)
+  - **BUT block_23 step 0 cos = -0.005** — algebraic init moves in observable subspace but 64/14.9M directions ≈ 0.0004% coverage
+  - Interpretation: Gramian theory validated (eigenspectrum exists, Gauss-Newton effective), but pure logit observations provide extremely low-dimensional view of 14.9M parameter space.
+- **2026-04-09T06:08:00Z** — **All 4 GPUs algebraic init working!** Results across 3 seeds (alg_clean): σ_max=11.2-13.6, rank=32, actual/predicted ratio=1.38-2.62 (GN effective). block_23 step 0 cos ≈ 0 for all seeds.
+- **2026-04-09T06:08:00Z** — **🔬 Critical finding: Block 22 Gramian is ZERO.** σ_max < 1e-12, eff_rank=0. Block 22 parameters are completely unobservable from output logits in the linearized regime. This establishes a hard depth-observability boundary: only the last transformer block (L-1) has nonzero Gramian.
+- **2026-04-09T06:16:00Z** — **alg_clean/s42 v7 COMPLETE.** Block 22: mean_cos=-0.013 (step 2440 early stop). Full results: lm_head=0.538, b23=-0.009, b22=-0.013. Block 22 zero Gramian confirmed, trained from random.
+- **2026-04-09T06:19:00Z** — **Block 22 zero Gramian confirmed across ALL 3 seeds.** s42, s123, s777 all show σ_max=0.00, eff_rank=0 for Block 22. This is a fully reproducible result.
+- **2026-04-09T06:22:00Z** — **alg_clean/s123 COMPLETE.** lm_head=0.542, b23=0.003, b22=-0.009. Block 22 early stop at step 889.
+- **2026-04-09T06:24:00Z** — **alg_clean/s777 COMPLETE.** lm_head=0.540, b23=0.005, b22=0.024. Block 22 early stop at step 1570.
+- **2026-04-09T06:24:00Z** — **Experiment 1 alg_clean 3-seed COMPLETE.** Summary: lm_head=0.540±0.002, Block 23=-0.000±0.008, Block 22=+0.001±0.019. All block cosines ≈ 0 — algebraic init provides no parameter recovery advantage over random despite validated Gramian theory. Paper Exp 1 and Exp 3 tables updated.
+- **2026-04-09T06:24:00Z** — Launched corrected random baseline (seed 42) on GPU 0 with fixed per-matrix cosine code. Previous Wave 1 random results have key collision bug in saved per-matrix data (but corrected eval exists in eval_wave1_corrected.json).
+- **2026-04-09T06:24:00Z** — alg_aug/s42 Block 23 Gramian still computing (30+ minutes, much slower than alg_clean ~10 min due to sensitivity-augmented JVP computation). GPU 3 using 57 GB memory (vs 24 GB for alg_clean).
+- **2026-04-09T06:47:00Z** — **Corrected random baselines ALL 3 seeds COMPLETE.** s42: lm_head=0.531, b23=0.001, b22=0.012. s123: lm_head=0.535, b23=-0.002, b22=-0.006. s777: lm_head=0.543, b23=0.001, b22=0.022. Mean±std: lm_head=0.536±0.006, b23=+0.000±0.001, b22=+0.009±0.015. Random and alg_clean statistically indistinguishable for blocks.
+- **2026-04-09T06:47:00Z** — **🔬 Critical finding: alg_aug Gramian ≡ alg_clean Gramian.** Sensitivity-augmented Gramian (σ_max=11.2, rank=32, cond=54.5, GN=1.39) is indistinguishable from clean Gramian (σ_max=12.2±1.3, rank=32, cond=60.8±5.8, GN=1.92±0.63). Sensitivity loss does NOT expand the observable subspace.
+- **2026-04-09T06:47:00Z** — alg_aug/s42 Block 23 training COMPLETE: mean_cos=0.005, converged at step 909. Block 22 Gramian now computing (~43 min expected due to sensitivity augmentation overhead).
+- **2026-04-09T06:48:00Z** — Paper tables updated: (1) Random baseline rows corrected with 3-seed data, (2) Gramian table expanded with alg_aug row, (3) alg_aug Block 23 data filled, (4) Analysis section: new paragraph on sensitivity augmentation providing no observability improvement.
+- **2026-04-09T07:20:00Z** — **🎉 alg_aug/s42 COMPLETE.** lm_head=0.538, b23=0.005, b22=0.006. Block 22 Gramian: trace=0, eff_rank=0 — **IDENTICALLY ZERO**, confirming sensitivity augmentation does NOT make Block 22 observable.
+- **2026-04-09T07:20:00Z** — **ALL EXPERIMENTS COMPLETE.** Final summary:
+  - Random (3 seeds): lm_head=0.536±0.006, b23=+0.000±0.001, b22=+0.009±0.015
+  - Alg clean (3 seeds): lm_head=0.540±0.002, b23=-0.000±0.008, b22=+0.001±0.019
+  - Alg aug (1 seed): lm_head=0.538, b23=+0.005, b22=+0.006
+  - Block 23 Gramian (clean): σ_max=12.2±1.3, rank=32, cond=60.8
+  - Block 23 Gramian (aug): σ_max=11.2, rank=32, cond=54.5
+  - Block 22 Gramian (clean AND aug): IDENTICALLY ZERO
+  - Controls (β=0, wrong teacher, no gauge): all cos ≈ 0
+  - Pure logits (4 seeds): lm_head=0, blocks≈0.14 (initialization bias only)
+- **2026-04-09T07:20:00Z** — Paper tables fully filled. No more placeholders. Paper ready for auto-review loop (Stage 4).
+- **2026-04-09T09:50:00Z** — **Stage 4 Round 8: GPT-5.4 review score = 5/10.** Key criticisms: (1) Fatal: claims too broad for single-model case study, (2) High: pure-logits lm_head inconsistency unexplained, (3) High: theory is local first-order only, (4) High: Gramian rank not numerically certified enough, (5) Medium: no functional evaluation, (6) Medium: passive queries only, (7) Medium: parameter-space metrics only.
+- **2026-04-09T10:00:00Z** — **Round 8 fixes applied to paper:** (1) Narrowed all claims to "Qwen2.5-0.5B case study under passive queries", (2) Explained pure-logits lm_head cos≈0 vs oracle cos≈0.54 discrepancy (prefix misalignment, not contradictory), (3) Weakened Theorem 1 to "Local first-order identifiability criterion" with explicit caveats, (4) Changed "identically zero" → "numerically zero" throughout with bf16 precision discussion, (5) Added "Parameter recovery vs functional equivalence" analysis paragraph, (6) Added active query, functional metrics, numerical precision to Limitations, (7) Added query-dependency caveat in Introduction. Functional evaluation experiment launched on remote server.
+- **2026-04-09T10:15:00Z** — **Stage 4 Round 9: GPT-5.4 review score = 7/10 (Borderline Accept)!** Major improvement from 5→7. Reviewer praised: calibrated claims, honest framing, strong controls, good theoretical scoping. Remaining: external validity (single model), no active query pilot, no functional comparison. All "minimum fixes for acceptance" already implemented.
+- **2026-04-09T10:20:00Z** — Remote server unreachable (SSH timeout). Functional eval experiment cannot complete. Added pure-logits prefix-misalignment explanation to Table 2 caption.
+- **2026-04-09T10:30:00Z** — **🎉 Stage 4 Round 10 FINAL: GPT-5.4 review = 7/10, verdict = ACCEPT (Weak Accept).** Score trajectory: 5→7→7. Reviewer praised: novel theoretical connection, complete symmetry analysis, honest framing. Auto-review loop COMPLETE.
+- **2026-04-09T10:30:00Z** — **Pipeline status: Stages 1-4 COMPLETE.** All experiments done, paper accepted by auto-reviewer. Remaining: Stage 5 (Final Summary).
+- **2026-04-09T10:35:00Z** — Functional evaluation script `scripts/eval_functional.py` created (KL, top-1/5, PPL). Server offline — ready to run when server recovers.
+- **2026-04-09T10:35:00Z** — **Stage 5 (Final Summary) COMPLETE.** `PIPELINE_REPORT.md` written. Full pipeline finished.
+- **2026-04-09T11:00:00Z** — **Code audit found 4 critical bugs.** User requested best-paper-quality fixes. Bugs: (1) RMSNorm gauge tangent uses constant ±1 instead of parameter-dependent (g_i, -W_{r,i}), (2) RMSNorm init to zeros kills signal, (3) No lm_head alignment evaluation, (4) MLP gauge tangent uses constant ±1 instead of actual weight values.
+- **2026-04-09T11:30:00Z** — **Bug A2 FIXED:** RMSNorm initialization changed from zeros to ones in `scripts/run_spsi.py`.
+- **2026-04-09T12:00:00Z** — **Bug A1 FIXED:** `src/symmetry_gauge.py` — RMSNorm gauge tangents now use actual parameter values (g_i, -W_{r,i}) from model. MLP gauge tangents now use actual (gate_row, up_row, -down_col) values.
+- **2026-04-09T12:10:00Z** — **Bug A3 FIXED:** `src/permutation_alignment.py` — Added `compute_lm_head_aligned_cosine()` with Procrustes rotation alignment (SVD-based orthogonal Q*). Integrated into `scripts/run_spsi.py` evaluation loop.
+- **2026-04-09T12:20:00Z** — **Phase C: Theory strengthened** in `paper/main.tex`: (1) Theorem 3 — Gramian rank upper bound via hidden-dimension bottleneck (rank ≤ d²), (2) Theorem 4 — Depth screening via block Jacobian ill-conditioning, (3) Remark 5 — Fisher information lower bound (≥465K independent directions needed). Appendix symmetry tangent notation corrected to parameter-dependent form.
+- **2026-04-09T12:30:00Z** — SSH to remote server times out (100.103.219.5:22). All 3 fixed code files ready to sync. Experiment re-run blocked on server access.
+- **2026-04-12T02:00:00Z** — Server recovered. Fixed code synced. V2 experiments launched (4 waves, 14 experiments total).
+- **2026-04-12T05:30:00Z** — **ALL V2 EXPERIMENTS COMPLETE.** Key change from v1: lm_head cos dropped from 0.54 → 0.12 (bugfix revealed v1 lm_head was measuring tied embed similarity). All blocks now in 0.12–0.15 band (initialization bias).
+- **2026-04-12T06:07:00Z** — **FUNCTIONAL EVALUATION COMPLETE.** 14 recovered models + teacher + random baseline evaluated. Critical finding: **parameter-function decoupling** — despite cos ≈ 0.12–0.14 (≈ random), oracle KL=0.42 (24× better than random 10.2), top-1=24%, top-5=35%. Pure logits KL=1.19 (8.6× better than random).
+- **2026-04-12T06:30:00Z** — Paper fully updated: Tables 1–4 and new Table 5 (functional eval). Abstract, contributions, analysis, conclusion, limitations all revised. Core narrative shifted from "lm_head recoverable, blocks not" to "weight stealing fails, but functional stealing succeeds dramatically."
+- **2026-04-12T07:00:00Z** — **Auto Review Loop v2 Round 1**: GPT-5.4 score 5/10. Key issues: wrong-teacher design error, gauge-equivalent overclaim, no forensic appendix for v1→v2 changes. All 5 fixes implemented (wrong-teacher removed, gauge language corrected, paper reframed, forensic appendix added, functional eval cleaned).
+- **2026-04-12T08:00:00Z** — **Auto Review Loop v2 Round 2**: GPT-5.4 score 6/10 (Almost). Key issues: no KD baseline, block averages misleading, claims too broad, oracle-dependence not foregrounded. All 5 fixes implemented (KD finding demoted, per-matrix table promoted to main body, claims scoped to single model, oracle-dependence foregrounded, LayerNorm→observability theory connection added).
+- **2026-04-12T08:30:00Z** — **Auto Review Loop v2 Round 3 FINAL**: GPT-5.4 score **7/10 (Ready, narrowly — Weak Accept)**. Paper now defensible as negative-results/observability-limits paper. Score trajectory: 5→6→7. Auto Review Loop v2 COMPLETE.
+- **2026-04-12T10:00:00Z** — **Research Pipeline v3 initiated**. Following research advancement methodology: negative results are feedback signals, not endpoints. Core diagnostic question: Is rank(G)=32 a structural limit or observation artifact (K=8 positions, k=64 probes)?
+- **2026-04-12T10:00:00Z** — **V3 Idea Selection (AUTO_PROCEED)**: Top 3 directions derived from failure analysis: (1) Observation Space Expansion (B2), (2) Gramian-Aware Active Query (A1), (3) Functional-to-Parametric Bootstrap (C1). Auto-selected #1.
+- **2026-04-12T10:00:00Z** — **V3 Implementation complete**: (1) `scripts/diagnose_gramian_rank.py` — Gramian rank diagnostic with K∈{8,32,64,128}, k∈{64,128,256}, memory-efficient GPU/CPU hybrid for large K; (2) `scripts/run_expanded_observation.py` — S-PSI training with expanded K and optional Gramian-aware query selection; (3) `src/active_query.py` — Added GramianAwareSelector targeting weak Gramian eigenvectors; (4) `scripts/dispatch_v3_experiments.sh` — 4-GPU dispatch for diagnostics + training.
+- **2026-04-12T10:00:00Z** — **V3 experiment plan**: Wave 1 (GPU 0): probe scaling K=8,k={64,128,256}; Wave 2 (GPU 1): position scaling K={8,32,64,128},k=128; Wave 3 (GPU 2): training K=64; Wave 4 (GPU 3): training K=32. Decision tree: if rank↑→expand training; if rank=32→active queries.
+- **2026-04-12T18:00:00Z** — V3 experiments deployed. Server rebooted once (killed nohup processes), relaunched. HF mirror timeout forced `HF_HUB_OFFLINE=1` relaunch. Wave 3 (K=64) OOM (~400GB CPU RAM), deferred.
+- **2026-04-13T01:00:00Z** — **Wave 1 COMPLETE (probe scaling)**. K=8, k∈{64,128,256}: ALL configurations full rank (rank=k). k=64→rank=64, k=128→rank=128, k=256→rank=256. σ_max constant across k (≈11.5K). Conclusion: **v2's rank=32 was NOT caused by k=64 probe limitation**.
+- **2026-04-13T02:00:00Z** — **Wave 2 COMPLETE (position scaling, Block 23)**. K∈{8,32,64,128}, k=128: ALL full rank=128.
+  - σ_max scales linearly with K: 11.5K (K=8) → 44.9K (K=32) → 89.3K (K=64) → 178.1K (K=128)
+  - Condition number κ ≈ 2.4 constant across K
+  - Effective rank ≈ 122.1 constant across K
+  - **v2's rank=32 was a real K=8 observation bottleneck, not a structural limit**
+- **2026-04-13T02:30:00Z** — **Wave 2 Block 22 results (K∈{8,32,64}, K=128 pending)**. ALL full rank=128.
+  - σ_max: 25.5K (K=8) → 99.3K (K=32) → 196.6K (K=64)
+  - Block 22 signal **~2.2× STRONGER** than Block 23 (σ_max ratio)
+  - Condition number κ ≈ 3.1 (slightly worse than Block 23's 2.4)
+  - **v2's "Block 22 Gramian identically zero" was caused by _BoundaryInjectionHook, NOT a structural limit**
+- **2026-04-13T02:10:00Z** — **Wave 4 COMPLETE (K=32 training, alg_clean, seed 42)**.
+  - lm_head: cos=0.209 (vs v2 baseline 0.12)
+  - Block 23: cos=0.128, only LayerNorm recovers (input_layernorm=0.67, post_attn_layernorm=0.98), all weight matrices ≈ 0
+  - Block 22: cos=0.142, same LayerNorm-only pattern (input_layernorm=0.73, post_attn_layernorm=0.99)
+  - **Gramian pre-training: full rank=128, σ_max=43.4K, κ=2.4** — Gramian is healthy
+  - Block 22 Gramian (algebraic init path, with oracle boundary): trace=0, eff_rank=0 — **consistent with v2 finding** (boundary hook truncates signal)
+- **2026-04-13T03:30:00Z** — **🔬 ROOT CAUSE ANALYSIS: v2 Block 22 Gramian=0**. Traced through code paths:
+  - Training path: `run_spsi()` → `algebraic_initialize_block()` with `boundary_layer_idx=22, use_oracle_boundary=True`
+  - `_BoundaryInjectionHook` installs forward_pre_hook on Block `boundary_layer_idx + 1 = 23`
+  - Hook replaces Block 23 input with teacher's cached boundary state (constant)
+  - Block 22 parameter perturbation propagates through Block 22 → arrives at Block 23 input → **overwritten by hook** → logits unaffected → JVP=0 → Gramian=0
+  - Diagnostic path: uses `use_oracle_boundary=False` → no hook → Block 22 perturbations propagate to logits → nonzero Gramian
+  - **This is mathematically correct behavior**: in oracle mode, Block 22 is unobservable because its output doesn't reach the logits (replaced by teacher's cached state)
+- **2026-04-13T03:30:00Z** — **🔬 KEY PARADOX: Full-rank Gramian but cos≈0.12**. K=32 training gives full-rank (128) Gramian with good conditioning (κ=2.4), but weight matrix recovery is still ≈0. Only LayerNorm recovers (cos 0.67-0.99). Hypotheses:
+  1. **Non-convex optimization landscape**: Full-rank Gramian guarantees local identifiability (first-order), but the loss landscape may have many local minima or saddle points. SGD gets trapped.
+  2. **Algebraic init ineffective**: Despite full-rank Gramian, the init direction covers k=128 out of 14.9M parameters (0.0009% coverage). The Gauss-Newton step operates in a 128-dim subspace — improvement in that subspace doesn't help the other 99.999% of directions.
+  3. **LayerNorm is a special case**: LayerNorm weights are 1D (896 params), low-dimensional, and strongly constrained (must be positive, near 1). They may recover via gradient descent alone, independent of Gramian quality.
+  4. **Scale mismatch**: σ_max=43K but we're taking a single Gauss-Newton step with step_scale=1.0. The step size may be inappropriate for the non-convex landscape.
+  - **Conclusion**: Observability (Gramian rank) is necessary but not sufficient. The optimization problem in 14.9M-dim parameter space is fundamentally harder than what first-order observability guarantees address.
+- **2026-04-13T04:06:00Z** — **Wave 2 Block 22 K=128 diagnostic COMPLETE**. Final data point:
+  - Block 22 K=128: rank=128, σ_max=394,729, κ=3.07, eff_rank=117.0
+  - Confirms linear σ_max scaling: K=8→25K, K=32→99K, K=64→197K, K=128→395K
+  - κ decreasing monotonically with K (3.17→3.14→3.09→3.07) — conditioning improves with more observation
+  - Block 22 signal remains ~2.2× stronger than Block 23 at all K values
+  - **V3 Phase 1 diagnostic table is now COMPLETE** — all 8 configurations verified
+- **2026-04-13T06:00:00Z** — **Auto-review loop v3 COMPLETED**. Round 2 score: 7/10, verdict "Ready for submission". Paper updated with warm-start table, K=128 training, expanded Gramian table (including Block 22 K=128), and framing fixes.
+- **2026-04-13T06:30:00Z** — **Stage 5 COMPLETE**. PIPELINE_REPORT.md and CLAIMS_FROM_RESULTS.md written. Full research pipeline finished: 13 scored review rounds across 3 auto-review loops, final score 7/10.

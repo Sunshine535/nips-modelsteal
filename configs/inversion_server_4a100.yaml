@@ -1,0 +1,68 @@
+# S-PSI: Server Configuration for 4x A100-80GB
+# Target: kemove@100.103.219.5
+# Save dir: /mnt/ae22ef98-e02a-4dfa-acf4-a307e8941cd9/nwh/nips/nips-modelsteal/results/
+
+teacher:
+  model_name: "Qwen/Qwen3.5-0.8B"
+  device: "cuda"
+  dtype: "bfloat16"
+  max_seq_len: 256
+
+student:
+  model_name: "Qwen/Qwen3.5-0.8B"
+  device: "cuda"
+  dtype: "bfloat16"
+  max_seq_len: 256
+
+# === S-PSI Inversion ===
+inversion:
+  query_budget: 500000
+  batch_size: 16
+  learning_rate: 1.0e-4
+  lm_head_lr: 1.0e-3
+  max_steps_per_block: 10000
+  lm_head_steps: 5000
+  convergence_threshold: 1.0e-7
+  patience: 500
+
+  # Sensitivity matching
+  alpha: 1.0
+  beta: 0.1
+  gamma: 1.0e-5
+  num_perturbation_positions: 4
+  num_replacement_tokens: 2
+
+  # Suffix blocks to recover (from output)
+  num_suffix_blocks: 2
+
+  # Number of random initializations for identifiability
+  num_inits: 5
+
+  # Regimes to run
+  regimes:
+    - "oracle"
+    - "pure_logits"
+
+  output_dir: "results/spsi"
+  seed: 42
+
+# === Evaluation ===
+evaluation:
+  metrics:
+    - "per_matrix_cosine_similarity"
+    - "cross_init_variance"
+    - "output_agreement"
+  num_eval_samples: 2000
+  output_dir: "results/evaluation"
+
+# === Hardware (4x A100-80GB) ===
+hardware:
+  num_gpus: 4
+  gpu_type: "A100-80GB"
+  gradient_checkpointing: true
+
+# === Logging ===
+logging:
+  level: "INFO"
+  log_dir: "logs"
+  save_every_n_steps: 2000
