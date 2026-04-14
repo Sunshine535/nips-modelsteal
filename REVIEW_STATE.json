@@ -1,9 +1,23 @@
 {
-  "round": 2,
-  "threadId": "019d833d-3fd0-7ee1-b578-39981d6734e2",
+  "round": 3,
+  "threadId": "019d87d6-b7f6-7e50-ba54-a29c2ab3d730",
   "status": "completed",
-  "difficulty": "medium",
+  "difficulty": "nightmare",
   "last_score": 7.0,
-  "last_verdict": "Ready for submission",
-  "timestamp": "2026-04-13T06:00:00"
+  "last_verdict": "almost (borderline submittable)",
+  "score_progression": [6.0, 6.5, 7.0],
+  "pending_experiments": [],
+  "timestamp": "2026-04-14T12:30:00",
+  "key_fixes": [
+    "Removed all stale rank≈32 references — v3 data shows full rank for all tested configs",
+    "Added Llama-3.2-1B cross-architecture validation (blocks cos≈0.22, lm_head cos≈0.66)",
+    "Scoped warm-start to block-local oracle experiment",
+    "Updated PROOF_SKELETON.md with resolution notes",
+    "Labeled Llama mechanism claim as conjecture"
+  ],
+  "remaining_issues": [
+    "Core table provenance (Exp1/2/3/4 raw JSONs not checked in)",
+    "No matched-budget KD baseline",
+    "Invalid active-query artifact still in repo (excluded from paper)"
+  ]
 }

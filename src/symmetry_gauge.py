@@ -16,9 +16,10 @@ Key symmetries:
   1. RMSNorm scale absorption: For each RMSNorm, scaling g' = D*g with D
      diagonal can be absorbed by inverse scaling consumer weights.
      Tangent: eps_i * (d/dg_i - sum_j d/dW_consumer_ij).
-  2. Gated MLP neuron scaling: For SiLU-gated MLP, scale up/gate rows by d
-     and down columns by 1/d.
-     Tangent: eps_n * (d/d_up_n + d/d_gate_n - d/d_down_n).
+  2. Gated MLP up/down neuron scaling: For SiLU-gated MLP, scale up rows
+     by alpha and down columns by 1/alpha. Gate is NOT scaled because SiLU
+     is not positively homogeneous (SiLU(alpha*x) != alpha*SiLU(x)).
+     Tangent: eps_n * (d/d_up_n - d/d_down_n).
 """
 
 import logging
@@ -397,22 +398,18 @@ def build_gated_mlp_gauge_basis(
             continue
 
         # Read actual weight values for parameter-dependent gauge tangents
+        # Note: gate_proj is NOT included because SiLU is not positively
+        # homogeneous — only up/down scaling is an exact symmetry.
         model_params = dict(model.named_parameters())
-        gate_weight = model_params[gate_name].detach().float()
         up_weight = model_params[up_name].detach().float()
         down_weight = model_params[down_name].detach().float()
 
         for n in range(intermediate_size):
             # Lie algebra tangent at current θ for neuron scaling:
-            # d/dε|_{ε=0} gate_row_n*(1+ε) = gate_row_n
+            # The exact symmetry for SiLU-gated MLP only scales up and down,
+            # NOT gate, because SiLU is not positively homogeneous.
             # d/dε|_{ε=0} up_row_n*(1+ε) = up_row_n
             # d/dε|_{ε=0} down_col_n/(1+ε) = -down_col_n
-
-            # gate_proj row n: contiguous block of hidden_size elements
-            gate_start = gate_slice.start + n * hidden_size
-            gate_indices = torch.arange(gate_start, gate_start + hidden_size,
-                                        dtype=torch.int64)
-            gate_values = gate_weight[n].flatten().to(torch.float32)
 
             # up_proj row n: contiguous block of hidden_size elements
             up_start = up_slice.start + n * hidden_size
@@ -425,8 +422,8 @@ def build_gated_mlp_gauge_basis(
             down_indices = down_indices + down_slice.start
             down_values = -down_weight[:, n].flatten().to(torch.float32)
 
-            all_indices = torch.cat([gate_indices, up_indices, down_indices])
-            all_values = torch.cat([gate_values, up_values, down_values])
+            all_indices = torch.cat([up_indices, down_indices])
+            all_values = torch.cat([up_values, down_values])
 
             norm_val = all_values.norm()
             if norm_val > 1e-12:
@@ -790,6 +787,7 @@ def expected_gauge_dimensions(
     num_blocks: int,
     hidden_size: int,
     intermediate_size: int,
+    num_kv_heads: int = 0,
     include_final_norm: bool = True,
 ) -> dict:
     """Compute the expected number of gauge directions analytically.
@@ -797,6 +795,8 @@ def expected_gauge_dimensions(
     Per block:
       - 2 RMSNorm layers x hidden_size dims = 2 * hidden_size
       - 1 gated MLP x intermediate_size neurons = intermediate_size
+      - Attention V/O + Q/K scaling: 2 * num_kv_heads (not yet implemented
+        in build_gauge_basis, but counted here for theoretical reference)
 
     Plus optionally:
       - 1 final norm x hidden_size = hidden_size (if lm_head is in the spec)
@@ -805,9 +805,11 @@ def expected_gauge_dimensions(
     """
     rmsnorm_per_block = 2 * hidden_size
     mlp_per_block = intermediate_size
+    attention_per_block = 2 * num_kv_heads
 
     total_rmsnorm = num_blocks * rmsnorm_per_block
     total_mlp = num_blocks * mlp_per_block
+    total_attention = num_blocks * attention_per_block
 
     if include_final_norm:
         total_rmsnorm += hidden_size
@@ -815,11 +817,16 @@ def expected_gauge_dimensions(
     return {
         "rmsnorm_per_block": rmsnorm_per_block,
         "mlp_per_block": mlp_per_block,
+        "attention_per_block": attention_per_block,
         "total_rmsnorm": total_rmsnorm,
         "total_mlp": total_mlp,
-        "total": total_rmsnorm + total_mlp,
+        "total_attention": total_attention,
+        "total_implemented": total_rmsnorm + total_mlp,
+        "total_theoretical": total_rmsnorm + total_mlp + total_attention,
+        "total": total_rmsnorm + total_mlp,  # backward compat
         "num_blocks": num_blocks,
         "hidden_size": hidden_size,
         "intermediate_size": intermediate_size,
+        "num_kv_heads": num_kv_heads,
         "include_final_norm": include_final_norm,
     }

@@ -344,8 +344,14 @@ def main():
             args, device,
         )
 
+        # Move student off GPU before eval to free memory
+        student.cpu()
+        torch.cuda.empty_cache()
+        logger.info("  Student moved to CPU for evaluation")
+        sys.stdout.flush()
+
         # Evaluate: per-matrix aligned cosine for each suffix block
-        post_params = {n: p.data.cpu().clone() for n, p in student.named_parameters()}
+        post_params = {n: p.data.clone() for n, p in student.named_parameters()}
 
         block_results = []
         for block_idx in sorted(target_blocks):
@@ -360,11 +366,15 @@ def main():
                     break
 
             if prefix:
-                _, aligned = compute_aligned_cosine(
-                    post_params, ground_truth, prefix,
-                    num_attention_heads, head_dim,
-                )
-                mean_cos = sum(aligned.values()) / len(aligned) if aligned else 0
+                try:
+                    _, aligned = compute_aligned_cosine(
+                        post_params, ground_truth, prefix,
+                        num_attention_heads, head_dim,
+                    )
+                    mean_cos = sum(aligned.values()) / len(aligned) if aligned else 0
+                except Exception as e:
+                    logger.error("  Block %d eval failed: %s", block_idx, e)
+                    aligned, mean_cos = {}, 0
             else:
                 aligned, mean_cos = {}, 0
 
@@ -375,9 +385,14 @@ def main():
                 "per_matrix": {k: float(v) for k, v in aligned.items()},
             })
             logger.info("  Block %d: mean_cos=%.4f", block_idx, mean_cos)
+            sys.stdout.flush()
 
         # lm_head evaluation
-        lm_head_cos = compute_lm_head_aligned_cosine(post_params, ground_truth)
+        try:
+            lm_head_cos = compute_lm_head_aligned_cosine(post_params, ground_truth)
+        except Exception as e:
+            logger.error("  lm_head eval failed: %s", e)
+            lm_head_cos = {"raw_cosine": 0, "aligned_cosine": 0}
         logger.info("  lm_head: raw_cos=%.4f, aligned_cos=%.4f",
                     lm_head_cos.get("raw_cosine", 0),
                     lm_head_cos.get("aligned_cosine", 0))
@@ -404,9 +419,8 @@ def main():
         with open(init_dir / "kd_summary.json", "w") as f:
             json.dump(result, f, indent=2)
 
-        # Save model
-        model_to_save = student.module if hasattr(student, "module") else student
-        model_to_save.save_pretrained(init_dir / "recovered_model")
+        # Skip model saving to avoid disk/memory issues — we only need metrics
+        logger.info("  Init %d evaluation complete, skipping model save", init_idx)
 
         del student
         torch.cuda.empty_cache()

@@ -96,9 +96,10 @@ def align_attention_heads(
     rec_vecs = rec_vecs[:n]
     tea_vecs = tea_vecs[:n]
 
-    sim = F.cosine_similarity(
-        rec_vecs.unsqueeze(1), tea_vecs.unsqueeze(0), dim=-1
-    )
+    # Use normalize+matmul for efficient cosine similarity
+    rec_norm = F.normalize(rec_vecs, dim=-1)
+    tea_norm = F.normalize(tea_vecs, dim=-1)
+    sim = rec_norm @ tea_norm.T
     cost = 1.0 - sim.cpu().numpy()
     row_ind, col_ind = linear_sum_assignment(cost)
 
@@ -173,9 +174,10 @@ def align_ffn_neurons(
     rec_vecs = rec_vecs[:n]
     tea_vecs = tea_vecs[:n]
 
-    sim = F.cosine_similarity(
-        rec_vecs.unsqueeze(1), tea_vecs.unsqueeze(0), dim=-1
-    )
+    # Use normalize+matmul for large n to avoid broadcasting OOM
+    rec_norm = F.normalize(rec_vecs, dim=-1)
+    tea_norm = F.normalize(tea_vecs, dim=-1)
+    sim = rec_norm @ tea_norm.T
     cost = 1.0 - sim.cpu().numpy()
     row_ind, col_ind = linear_sum_assignment(cost)
 

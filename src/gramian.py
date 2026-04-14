@@ -184,8 +184,9 @@ def build_probe_matrix(
     # Generate on CPU (large), then move to target device for QR
     raw = torch.randn(p, k, generator=gen, dtype=dtype)
     # Economy QR: Q is p x k with orthonormal columns
-    # For large p (>1M), QR is much faster on GPU
-    if device.type == "cuda" and p > 100_000:
+    # For large p (>1M), QR is much faster on GPU — but for very large p (>10M),
+    # GPU QR can overflow internal allocations, so fall back to CPU.
+    if device.type == "cuda" and 100_000 < p <= 10_000_000:
         raw_dev = raw.to(device=device, dtype=dtype)
         Q, _ = torch.linalg.qr(raw_dev, mode="reduced")
         return Q  # already on device

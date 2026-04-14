@@ -32,6 +32,7 @@ from src.parameter_inverter import (
 from src.permutation_alignment import compute_aligned_cosine
 from src.gramian import (
     make_flat_param_spec, compute_sketched_gramian, jvp_logits,
+    GramianConfig,
 )
 from src.active_query import GramianAwareSelector
 
@@ -75,7 +76,43 @@ def build_query_pool(tokenizer, pool_size, max_seq_len, seed=42):
     return torch.stack(input_ids_list[:pool_size])
 
 
-def compute_gramian_for_block(student, block_names, query_ids, args, device):
+class MinimalCache:
+    """Minimal teacher cache for Gramian computation (same pattern as diagnose_gramian_rank.py)."""
+
+    def __init__(self, teacher_model, input_ids, device="cuda"):
+        self._full_input_ids = input_ids
+        self.input_ids = input_ids
+        self.device = device
+        self._teacher = teacher_model
+        self.clean_logits = None
+        self._logit_suffix_k = 0
+        self.perturbed_input_ids = None
+        self.perturbed_logits = None
+        self.boundary_states = {}
+
+    def build_for_K(self, K: int, query_indices: torch.Tensor):
+        """Pre-compute teacher logits for specific K and query subset."""
+        n = len(query_indices)
+        self._logit_suffix_k = K
+        self.input_ids = self._full_input_ids[query_indices]
+
+        logits_list = []
+        bs = 16
+        for start in range(0, n, bs):
+            end = min(start + bs, n)
+            batch = self.input_ids[start:end].to(self.device)
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                out = self._teacher(batch).logits.float()
+            if K > 0:
+                out = out[:, -K:, :]
+            logits_list.append(out.cpu())
+
+        self.clean_logits = torch.cat(logits_list)
+        logger.info("  Cache built: %d queries, K=%d, shape=%s",
+                     n, K, self.clean_logits.shape)
+
+
+def compute_gramian_for_block(student, teacher_model, block_names, query_ids, args, device):
     """Compute sketched Gramian and return eigendecomposition + probe matrix."""
     spec = make_flat_param_spec(student, block_names)
     K = args.logit_suffix_positions
@@ -92,7 +129,6 @@ def compute_gramian_for_block(student, block_names, query_ids, args, device):
         if gauge_basis is not None and gauge_basis.shape[1] > 0:
             logger.info("Gauge basis: %d directions (projecting out)", gauge_basis.shape[1])
             P_perp = torch.eye(spec.num_params) - gauge_basis @ gauge_basis.T
-            # Generate random probes in gauge-orthogonal complement
             raw = torch.randn(spec.num_params, k)
             projected = P_perp @ raw
             probe_matrix, _ = torch.linalg.qr(projected)
@@ -108,20 +144,38 @@ def compute_gramian_for_block(student, block_names, query_ids, args, device):
     # Subsample queries
     n_queries = min(args.gramian_query_subsample, len(query_ids))
     perm = torch.randperm(len(query_ids))[:n_queries]
-    query_subset = query_ids[perm]
 
-    G_sketch = compute_sketched_gramian(
-        student, query_subset, spec, probe_matrix,
-        logit_suffix_positions=K,
-        batch_size=1,
-        device=device,
+    # Build MinimalCache with teacher logits
+    cache = MinimalCache(teacher_model, query_ids, device=device)
+    cache.build_for_K(K, perm)
+
+    # GramianConfig
+    gram_config = GramianConfig(
+        num_probes=k,
+        query_subsample=n_queries,
+        ridge=1e-8,
+        include_sensitivity=False,
+        sensitivity_weight=0.0,
+        project_gauge=False,
+        seed=args.seed,
+        query_batch_size=2,
     )
 
-    eigenvalues, eigenvectors = torch.linalg.eigh(G_sketch.float())
-    # Sort descending
-    idx = eigenvalues.argsort(descending=True)
-    eigenvalues = eigenvalues[idx]
-    eigenvectors = eigenvectors[:, idx]
+    result = compute_sketched_gramian(
+        student=student,
+        cache=cache,
+        spec=spec,
+        query_indices=torch.arange(n_queries),
+        probe_matrix=probe_matrix,
+        config=gram_config,
+        spsi_config=None,
+        boundary_layer_idx=args.target_block,
+        use_oracle_boundary=False,
+        gauge_basis=None,
+    )
+
+    eigenvalues = result.eigenvalues
+    eigenvectors = result.eigenvectors
 
     logger.info("Gramian: σ_max=%.1f, σ_min=%.1e, κ=%.2f, eff_rank=%.1f",
                 eigenvalues[0].item(),
@@ -149,8 +203,16 @@ def run_one_condition(student, teacher_bb, query_ids, block_names,
         use_oracle_boundary=True,
     )
 
+    # Free cache memory before evaluation
+    del cache
+    torch.cuda.empty_cache()
+
+    # Move student to CPU for eval
+    student.cpu()
+    torch.cuda.empty_cache()
+
     # Evaluate
-    post_params = {n: p.data.cpu().clone() for n, p in student.named_parameters()}
+    post_params = {n: p.data.clone() for n, p in student.named_parameters()}
     prefix = None
     for name in post_params:
         parts = name.split(".")
@@ -312,7 +374,7 @@ def main():
         student_active.gradient_checkpointing_disable()
 
     spec, probe_matrix, eigenvalues, eigenvectors = compute_gramian_for_block(
-        student_active, block_names, full_pool, args, device,
+        student_active, teacher_model, block_names, full_pool, args, device,
     )
 
     # --- Condition 2: Active (Gramian-aware) query selection ---
