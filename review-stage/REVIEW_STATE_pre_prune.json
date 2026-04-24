@@ -1,0 +1,12 @@
+{
+  "round": 5,
+  "threadId": "019da29f-9aaa-7493-8a59-9863f1cc0c4a",
+  "status": "completed",
+  "difficulty": "nightmare",
+  "last_score": 8.5,
+  "last_verdict": "ready",
+  "score_progression": [5.0, 6.0, 7.0, 7.5, 8.0, 8.5],
+  "pending_experiments": [],
+  "timestamp": "2026-04-19T00:00:00",
+  "reviewer_final_recommendation": "Submit as-is; post-submission cleanup target: leak-free KD baseline."
+}

@@ -1,6 +1,6 @@
 # Proof Skeleton: Transformer Tomography
 
-> **Status (2026-04-14):** This document was created during Phase 0.5 of proof checking and contains the original discovery process for identifying issues. All issues flagged here (MC-2 SiLU symmetry, MC-5 rank bound, MC-6 depth screening factorization) have been **RESOLVED** in the paper and code. See `PROOF_AUDIT.md` for the full fix history and final 7.5/10 score. The working notes below are preserved as audit trail.
+> **Status (2026-04-14, updated after Round 4):** This document was created during Phase 0.5 of proof checking and contains the original discovery process. All issues flagged here (MC-2, MC-5, MC-6) were resolved in Rounds 1-3. **Round 4 (nightmare/beast)** found 3 additional CRITICAL issues: GL(d_head) V/O symmetry missing, C* Q/K RoPE-commuting symmetry missing, and gauge dimension wrong (14,976/block not 6,660). All resolved. See `PROOF_AUDIT.md` for the full 4-round fix history and final 8.5/10 score.
 
 ## 1. Dependency DAG
 

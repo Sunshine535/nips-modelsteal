@@ -1,0 +1,103 @@
+{
+  "date": "2026-04-16",
+  "auditor": "GPT-5.4 xhigh (fresh zero-context thread)",
+  "thread_id": "019d9bd1-17f4-7243-ad89-10cb1e359221",
+  "paper": "Transformer Tomography: Characterizing Weight Identifiability Limits from Black-Box Logit Access",
+  "difficulty": "nightmare",
+  "effort": "beast",
+  "overall_verdict": "FAIL",
+  "total_claims": 38,
+  "status_counts": {
+    "exact_match": 2,
+    "rounding_ok": 24,
+    "config_mismatch": 2,
+    "scope_overclaim": 1,
+    "ambiguous_mapping": 2,
+    "number_mismatch": 3,
+    "missing_evidence": 4,
+    "non_quantitative_mismatch": 1
+  },
+  "critical_issues": [
+    {
+      "id": 22,
+      "severity": "number_mismatch",
+      "location": "Table 5 warmstart α=0.7",
+      "paper_value": "post=0.854, Δ=-0.001",
+      "evidence_value": "post=0.8534508, Δ=-0.0004751",
+      "fix": "post=0.853, Δ=-0.000"
+    },
+    {
+      "id": 23,
+      "severity": "number_mismatch",
+      "location": "Table 5 caption / §7 / §10",
+      "paper_value": "|Δ| ≤ 0.01",
+      "evidence_value": "max|Δ|=0.01037 at α=0",
+      "fix": "|Δ| ≤ 0.011 or |Δcos| < 0.011"
+    },
+    {
+      "id": 29,
+      "severity": "number_mismatch",
+      "location": "Table 9 gauge-invariant Block 23",
+      "paper_value": "W_V raw=+0.002, W_O GL=-0.001",
+      "evidence_value": "W_V raw=0.001479, W_O GL=-0.000453",
+      "fix": "W_V raw=+0.001, W_O GL=-0.000"
+    },
+    {
+      "id": 19,
+      "severity": "missing_evidence",
+      "location": "Table 3 Block 22 +boundary row",
+      "paper_value": "σ_max<1e-12, κ=∞, eff.rank=0",
+      "evidence_value": "not in any JSON",
+      "fix": "add raw JSON or footnote"
+    },
+    {
+      "id": "embeddings",
+      "severity": "non_quantitative_mismatch",
+      "location": "§6 Setup — tied embeddings",
+      "paper_value": "tied embeddings",
+      "evidence_value": "student config.json: tie_word_embeddings: false",
+      "fix": "clarify teacher vs student untying"
+    }
+  ],
+  "warning_issues": [
+    {
+      "id": 1,
+      "severity": "scope_overclaim",
+      "location": "Abstract / §1 / §7 / §8",
+      "issue": "K×k grid described but only K-sweep at k=128 AND k-sweep at K=8 exist (not full 4×3 grid)"
+    },
+    {
+      "id": 7,
+      "severity": "config_mismatch",
+      "location": "§6 Setup",
+      "issue": "claims 2048×128 but v2 primary runs used 4096×192"
+    },
+    {
+      "id": 9,
+      "severity": "config_mismatch",
+      "location": "§6 Setup hyperparameters",
+      "issue": "k=128/r=64 matches v3 but v2 primary used k=64/r=32"
+    },
+    {
+      "id": 20,
+      "severity": "ambiguous_mapping",
+      "location": "Table 4 caption κ=2.4",
+      "issue": "κ=2.4 from independent diagnostic, not the training artifact bundled with the experiment"
+    },
+    {
+      "id": 33,
+      "severity": "ambiguous_mapping",
+      "location": "§5 Teacher Cache 120→8 GB",
+      "issue": "actual numbers with stated config are 74.2/4.6 GB"
+    }
+  ],
+  "strong_matches_count": 26,
+  "recommended_actions_priority": [
+    "Fix 3 number_mismatch entries (22, 23, 29) — simple text edits",
+    "Clarify 2 config_mismatch entries (7, 9) — split v2/v3 setup descriptions",
+    "Document 4 missing_evidence entries (19, 36, 37, 38) — add JSONs or soften language",
+    "Resolve tied_embeddings contradiction — clarify teacher vs student",
+    "Clarify 1 scope_overclaim (1) — state partial sweep or run full grid",
+    "Clarify 2 ambiguous_mapping entries (20, 33) — specify source"
+  ]
+}

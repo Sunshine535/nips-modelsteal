@@ -1,23 +1,27 @@
 {
-  "round": 3,
-  "threadId": "019d87d6-b7f6-7e50-ba54-a29c2ab3d730",
+  "round": 5,
+  "threadId": "019da29f-9aaa-7493-8a59-9863f1cc0c4a",
   "status": "completed",
   "difficulty": "nightmare",
-  "last_score": 7.0,
-  "last_verdict": "almost (borderline submittable)",
-  "score_progression": [6.0, 6.5, 7.0],
+  "last_score": 8.5,
+  "last_verdict": "ready",
+  "score_progression": [5.0, 6.0, 7.0, 7.5, 8.0, 8.5],
+  "score_progression_note": "5.0 (round 1 initial) → 6.0 (round 1 debate) → 7.0 (round 2 after narrative scoping + proof block + clone README) → 7.5 (round 3 after script quarantine + proof metadata cleanup) → 8.0 (round 4 after residual scoping sweep + provenance JSON v1) → 8.5 (round 5 final, provenance paths repaired, shorthand patched)",
   "pending_experiments": [],
-  "timestamp": "2026-04-14T12:30:00",
-  "key_fixes": [
-    "Removed all stale rank≈32 references — v3 data shows full rank for all tested configs",
-    "Added Llama-3.2-1B cross-architecture validation (blocks cos≈0.22, lm_head cos≈0.66)",
-    "Scoped warm-start to block-local oracle experiment",
-    "Updated PROOF_SKELETON.md with resolution notes",
-    "Labeled Llama mechanism claim as conjecture"
+  "timestamp": "2026-04-19T00:00:00",
+  "key_fixes_nightmare_second_pass": [
+    "R1-01: Added formal \\begin{proof} block to thm:screening (paper/main.tex line 335)",
+    "R1-02: PROOF_CHECK_STATE restructured from flat all_theorems_have_proofs bit to structured statement_status dict keyed by label",
+    "R1-03: Scoped abstract/contributions/conclusion/implications to 'under discrete-symmetry alignment' with inline pointer to Table 9 for W_V gauge-invariant partial recovery",
+    "R1-04: Baseline README (clone_2025) corrected from aspirational 0.95-0.99 to measured 0.68-0.79",
+    "R1-05: Added SAFETY NOTICE (2026-04-19) banners to matched_kd_baseline.py / attack_jacobian_fd.py / active_query_experiment.py explicitly documenting the teacher-copy / oracle-conditional contamination; noted that no paper-body result cites these scripts",
+    "R2-01: Swept residual unscoped language in body/captions/appendix (lines 498, 525, 536, 571, 719, 756, 762, 768, 822, 961)",
+    "R3-01: Added results/paper_tables_provenance.json mapping every paper table label to its checked-in source artifact(s) and aggregation recipe; repaired paths to regime_oracle/init_0 layout"
   ],
-  "remaining_issues": [
-    "Core table provenance (Exp1/2/3/4 raw JSONs not checked in)",
-    "No matched-budget KD baseline",
-    "Invalid active-query artifact still in repo (excluded from paper)"
-  ]
+  "remaining_issues_non_blocking": [
+    "Leak-free matched-budget KD baseline not run (disclosed as limitation in paper §8; Table 8 is ancillary)",
+    "v5_attack_* / v5_matched_kd / v5_active_query directories remote-only; not cited in main.tex; scripts quarantined with SAFETY NOTICEs",
+    "Reviewer explicitly states current state is NeurIPS-submittable as-is; remaining items would lose marginal score but are not hard blockers"
+  ],
+  "reviewer_final_recommendation": "Submit as-is rather than hold for uncited v5 work. Post-submission cleanup target: leak-free KD baseline."
 }

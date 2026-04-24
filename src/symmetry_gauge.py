@@ -5,11 +5,12 @@ For the Gramian to measure identifiability on the symmetry-quotiented space,
 we project probe directions out of the gauge (null) subspace spanned by
 continuous reparameterizations that preserve the input-output map.
 
-Supports: RMSNorm scale gauge, SiLU-gated MLP neuron scaling gauge.
+Supports: RMSNorm scale gauge, SiLU-gated MLP neuron scaling gauge,
+          Attention V/O GL(d_head) gauge, Attention Q/K RoPE (C*)^{d/2} gauge.
 
 Target architectures:
-  - Qwen3.5-0.8B: 24 blocks, 1024 hidden, 16 heads, intermediate=3584,
-    SiLU gated MLP, RMSNorm, tied embeddings.
+  - Qwen2.5-0.5B: 24 blocks, 896 hidden, 14 heads (2 KV heads GQA),
+    d_head=64, intermediate=4864, SiLU gated MLP, RMSNorm, tied embeddings.
   - Llama-3.2-1B: similar GQA + RMSNorm + SiLU gated MLP.
 
 Key symmetries:
@@ -20,6 +21,13 @@ Key symmetries:
      by alpha and down columns by 1/alpha. Gate is NOT scaled because SiLU
      is not positively homogeneous (SiLU(alpha*x) != alpha*SiLU(x)).
      Tangent: eps_n * (d/d_up_n - d/d_down_n).
+  3. Attention V/O GL(d_head) gauge: For each KV group, V -> S V, O -> O S^{-1}
+     with S in GL(d_head). Lie algebra tangent: d_head^2 directions E_{ab}
+     per KV group (full matrix Lie algebra gl(d_head)).
+  4. Attention Q/K RoPE (C*)^{d_head/2} gauge: Under RoPE, the 2x2 rotation
+     blocks commute with R_j = aI_2 + bJ (complex scalings). For each KV
+     group and frequency pair j, two tangent directions: scale and rotation.
+     Total: 2 * d_head/2 * num_kv_heads = d_head * num_kv_heads per block.
 """
 
 import logging
@@ -439,6 +447,298 @@ def build_gated_mlp_gauge_basis(
 
 
 # ---------------------------------------------------------------------------
+# Attention V/O GL(d_head) gauge basis
+# ---------------------------------------------------------------------------
+
+def _detect_attention_config(model: nn.Module, block_prefix: str):
+    """Detect num_heads, num_kv_heads, d_head from model config.
+
+    Returns (num_heads, num_kv_heads, d_head) or None if detection fails.
+    """
+    config = getattr(model, "config", None)
+    if config is None:
+        return None
+
+    num_heads = getattr(config, "num_attention_heads", None)
+    num_kv_heads = getattr(config, "num_key_value_heads", None)
+    hidden_size = getattr(config, "hidden_size", None)
+
+    if num_heads is None or hidden_size is None:
+        return None
+    if num_kv_heads is None:
+        num_kv_heads = num_heads  # MHA fallback
+
+    d_head = hidden_size // num_heads
+    return num_heads, num_kv_heads, d_head
+
+
+def build_attention_vo_gauge_basis(
+    model: nn.Module,
+    spec: FlatParamSpec,
+    block_indices: list,
+) -> list:
+    """Build gauge tangent vectors for attention V/O GL(d_head) symmetry.
+
+    For each block and each KV group g, the transformation V_g -> S V_g,
+    O_heads_in_g -> O_heads_in_g S^{-1} preserves the attention output.
+    The Lie algebra gl(d_head) has d_head^2 basis elements E_{ab}.
+
+    Tangent for E_{ab}:
+      - V: row a of V_group_g gets +V_group_g[b, :] (E_{ab} @ V)
+      - V bias: b_V[a] gets +b_V[b]
+      - O: for each head h in group g, column b of O_h gets -O_h[:, a]
+
+    Returns list of ``((indices, values), label)`` pairs in **sparse** format.
+    """
+    model_params = dict(model.named_parameters())
+    directions = []
+
+    for block_idx in block_indices:
+        prefix = None
+        for name in spec.names:
+            candidate = _find_block_prefix(name)
+            if candidate is not None and _block_idx_from_prefix(candidate) == block_idx:
+                prefix = candidate
+                break
+        if prefix is None:
+            continue
+
+        attn_config = _detect_attention_config(model, prefix)
+        if attn_config is None:
+            logger.warning("Block %d: could not detect attention config, skipping V/O gauge.", block_idx)
+            continue
+
+        num_heads, num_kv_heads, d_head = attn_config
+        heads_per_group = num_heads // num_kv_heads
+
+        v_name = prefix + "self_attn.v_proj.weight"
+        o_name = prefix + "self_attn.o_proj.weight"
+        v_bias_name = prefix + "self_attn.v_proj.bias"
+
+        v_slice = spec.name_to_slice(v_name)
+        o_slice = spec.name_to_slice(o_name)
+        v_bias_slice = spec.name_to_slice(v_bias_name)
+
+        if v_slice is None or o_slice is None:
+            logger.warning("Block %d: missing v_proj or o_proj in spec, skipping V/O gauge.", block_idx)
+            continue
+
+        v_idx = spec.name_to_index(v_name)
+        o_idx = spec.name_to_index(o_name)
+        v_shape = spec.shapes[v_idx]  # [num_kv_heads * d_head, hidden_size]
+        o_shape = spec.shapes[o_idx]  # [hidden_size, num_heads * d_head]
+
+        hidden_size = v_shape[1] if len(v_shape) > 1 else 1
+        v_total_rows = v_shape[0]  # num_kv_heads * d_head
+        o_out = o_shape[0]  # hidden_size
+        o_in = o_shape[1] if len(o_shape) > 1 else 1  # num_heads * d_head
+
+        W_V = model_params[v_name].detach().float()  # [kv_heads * d_head, hidden]
+        W_O = model_params[o_name].detach().float()  # [hidden, num_heads * d_head]
+        W_V_bias = None
+        if v_bias_slice is not None and v_bias_name in model_params:
+            W_V_bias = model_params[v_bias_name].detach().float()  # [kv_heads * d_head]
+
+        for g in range(num_kv_heads):
+            # V rows for this KV group: [g*d_head : (g+1)*d_head, :]
+            v_row_start = g * d_head
+            v_row_end = v_row_start + d_head
+
+            # Heads in this group
+            head_start = g * heads_per_group
+            head_end = head_start + heads_per_group
+
+            for a in range(d_head):
+                for b in range(d_head):
+                    pairs = []
+
+                    # Tangent on V: row a of V_group gets +V_group[b, :]
+                    # V is stored as [kv_heads*d_head, hidden_size], row-major
+                    v_row_a = v_row_start + a
+                    v_row_b = v_row_start + b
+                    for col in range(hidden_size):
+                        val = W_V[v_row_b, col].item()
+                        if abs(val) > 1e-15:
+                            flat_idx = v_slice.start + v_row_a * hidden_size + col
+                            pairs.append((flat_idx, val))
+
+                    # Tangent on V bias: b_V[a] gets +b_V[b]
+                    if W_V_bias is not None and v_bias_slice is not None:
+                        bias_val = W_V_bias[v_row_b].item()
+                        if abs(bias_val) > 1e-15:
+                            flat_idx = v_bias_slice.start + v_row_a
+                            pairs.append((flat_idx, bias_val))
+
+                    # Tangent on O: for each head h in group, col b of O_h gets -O_h[:, a]
+                    # O is stored as [hidden_size, num_heads * d_head], row-major
+                    for h in range(head_start, head_end):
+                        o_col_a = h * d_head + a
+                        o_col_b = h * d_head + b
+                        for row in range(o_out):
+                            val = -W_O[row, o_col_a].item()
+                            if abs(val) > 1e-15:
+                                flat_idx = o_slice.start + row * o_in + o_col_b
+                                pairs.append((flat_idx, val))
+
+                    sparse_dir = _build_sparse_direction(pairs)
+                    if sparse_dir is not None:
+                        label = f"attn_vo_gauge_block{block_idx}_g{g}_E{a}_{b}"
+                        directions.append((sparse_dir, label))
+
+    logger.info(
+        "Built %d attention V/O GL(d_head) gauge directions for blocks %s.",
+        len(directions), block_indices,
+    )
+    return directions
+
+
+# ---------------------------------------------------------------------------
+# Attention Q/K RoPE (C*)^{d_head/2} gauge basis
+# ---------------------------------------------------------------------------
+
+def build_attention_qk_rope_gauge_basis(
+    model: nn.Module,
+    spec: FlatParamSpec,
+    block_indices: list,
+) -> list:
+    """Build gauge tangent vectors for attention Q/K RoPE symmetry.
+
+    Under RoPE, the rotation matrix R(theta_j) for frequency pair j acts on
+    the 2D subspace (2j, 2j+1). Matrices that commute with ALL RoPE rotations
+    in this subspace are exactly C* = {aI_2 + bJ : (a,b) != (0,0)}, where
+    J = [[0,-1],[1,0]].
+
+    For each KV group g and frequency pair j in [d_head/2]:
+      - Scale tangent (aI_2): Q rows 2j,2j+1 get +Q[2j:2j+2,:],
+                               K rows 2j,2j+1 get -K[2j:2j+2,:]
+      - Rotation tangent (bJ): Q row 2j gets +Q[2j+1,:], Q row 2j+1 gets -Q[2j,:],
+                                K row 2j gets -K[2j+1,:], K row 2j+1 gets +K[2j,:]
+
+    Returns list of ``((indices, values), label)`` pairs in **sparse** format.
+    """
+    model_params = dict(model.named_parameters())
+    directions = []
+
+    for block_idx in block_indices:
+        prefix = None
+        for name in spec.names:
+            candidate = _find_block_prefix(name)
+            if candidate is not None and _block_idx_from_prefix(candidate) == block_idx:
+                prefix = candidate
+                break
+        if prefix is None:
+            continue
+
+        attn_config = _detect_attention_config(model, prefix)
+        if attn_config is None:
+            logger.warning("Block %d: could not detect attention config, skipping Q/K RoPE gauge.", block_idx)
+            continue
+
+        num_heads, num_kv_heads, d_head = attn_config
+        heads_per_group = num_heads // num_kv_heads
+        half_d = d_head // 2
+
+        q_name = prefix + "self_attn.q_proj.weight"
+        k_name = prefix + "self_attn.k_proj.weight"
+
+        q_slice = spec.name_to_slice(q_name)
+        k_slice = spec.name_to_slice(k_name)
+
+        if q_slice is None or k_slice is None:
+            logger.warning("Block %d: missing q_proj or k_proj in spec, skipping Q/K RoPE gauge.", block_idx)
+            continue
+
+        q_idx = spec.name_to_index(q_name)
+        k_idx = spec.name_to_index(k_name)
+        q_shape = spec.shapes[q_idx]  # [num_heads * d_head, hidden_size]
+        k_shape = spec.shapes[k_idx]  # [num_kv_heads * d_head, hidden_size]
+
+        hidden_size = q_shape[1] if len(q_shape) > 1 else 1
+
+        W_Q = model_params[q_name].detach().float()  # [num_heads * d_head, hidden]
+        W_K = model_params[k_name].detach().float()  # [kv_heads * d_head, hidden]
+
+        for g in range(num_kv_heads):
+            # K rows for this KV group
+            k_row_base = g * d_head
+
+            # Q heads in this group
+            head_start = g * heads_per_group
+            head_end = head_start + heads_per_group
+
+            for j in range(half_d):
+                # --- Scale tangent (a=1, b=0): aI_2 ---
+                # Q: rows 2j, 2j+1 of each head in group get +Q[2j:2j+2, :]
+                # K: rows 2j, 2j+1 of group get -K[2j:2j+2, :]
+                scale_pairs = []
+
+                for h in range(head_start, head_end):
+                    q_row_2j = h * d_head + 2 * j
+                    q_row_2j1 = h * d_head + 2 * j + 1
+                    for col in range(hidden_size):
+                        val_2j = W_Q[q_row_2j, col].item()
+                        if abs(val_2j) > 1e-15:
+                            scale_pairs.append((q_slice.start + q_row_2j * hidden_size + col, val_2j))
+                        val_2j1 = W_Q[q_row_2j1, col].item()
+                        if abs(val_2j1) > 1e-15:
+                            scale_pairs.append((q_slice.start + q_row_2j1 * hidden_size + col, val_2j1))
+
+                k_row_2j = k_row_base + 2 * j
+                k_row_2j1 = k_row_base + 2 * j + 1
+                for col in range(hidden_size):
+                    val_2j = -W_K[k_row_2j, col].item()
+                    if abs(val_2j) > 1e-15:
+                        scale_pairs.append((k_slice.start + k_row_2j * hidden_size + col, val_2j))
+                    val_2j1 = -W_K[k_row_2j1, col].item()
+                    if abs(val_2j1) > 1e-15:
+                        scale_pairs.append((k_slice.start + k_row_2j1 * hidden_size + col, val_2j1))
+
+                sparse_dir = _build_sparse_direction(scale_pairs)
+                if sparse_dir is not None:
+                    label = f"attn_qk_rope_scale_block{block_idx}_g{g}_j{j}"
+                    directions.append((sparse_dir, label))
+
+                # --- Rotation tangent (a=0, b=1): bJ ---
+                # Q: row 2j gets +Q[2j+1,:], row 2j+1 gets -Q[2j,:]
+                # K: row 2j gets -K[2j+1,:], row 2j+1 gets +K[2j,:]
+                rot_pairs = []
+
+                for h in range(head_start, head_end):
+                    q_row_2j = h * d_head + 2 * j
+                    q_row_2j1 = h * d_head + 2 * j + 1
+                    for col in range(hidden_size):
+                        # Q row 2j gets +Q[2j+1, :]
+                        val = W_Q[q_row_2j1, col].item()
+                        if abs(val) > 1e-15:
+                            rot_pairs.append((q_slice.start + q_row_2j * hidden_size + col, val))
+                        # Q row 2j+1 gets -Q[2j, :]
+                        val = -W_Q[q_row_2j, col].item()
+                        if abs(val) > 1e-15:
+                            rot_pairs.append((q_slice.start + q_row_2j1 * hidden_size + col, val))
+
+                for col in range(hidden_size):
+                    # K row 2j gets -K[2j+1, :]
+                    val = -W_K[k_row_2j1, col].item()
+                    if abs(val) > 1e-15:
+                        rot_pairs.append((k_slice.start + k_row_2j * hidden_size + col, val))
+                    # K row 2j+1 gets +K[2j, :]
+                    val = W_K[k_row_2j, col].item()
+                    if abs(val) > 1e-15:
+                        rot_pairs.append((k_slice.start + k_row_2j1 * hidden_size + col, val))
+
+                sparse_dir = _build_sparse_direction(rot_pairs)
+                if sparse_dir is not None:
+                    label = f"attn_qk_rope_rot_block{block_idx}_g{g}_j{j}"
+                    directions.append((sparse_dir, label))
+
+    logger.info(
+        "Built %d attention Q/K RoPE gauge directions for blocks %s.",
+        len(directions), block_indices,
+    )
+    return directions
+
+
+# ---------------------------------------------------------------------------
 # Combined gauge basis with orthonormalization
 # ---------------------------------------------------------------------------
 
@@ -457,33 +757,39 @@ def build_suffix_gauge_basis(
     block_indices: list,
     include_rmsnorm: bool = True,
     include_mlp: bool = True,
+    include_attention_vo: bool = True,
+    include_attention_qk_rope: bool = True,
     device: str = "cpu",          # kept for API compat; not used for dense alloc
 ) -> GaugeBasis:
     """Build the complete gauge basis for suffix blocks (memory-efficient).
 
-    Combines RMSNorm + gated MLP gauge directions.
+    Combines RMSNorm + gated MLP + attention V/O + attention Q/K RoPE gauge
+    directions.
 
     **Unlike the previous implementation** this does **not** construct a dense
     ``[p, g]`` matrix (which would be ~396 GB for a single block of Qwen-0.5B).
     Instead, each gauge direction is stored in sparse ``(indices, values)``
     form.  The directions are already individually normalised by the upstream
-    ``build_rmsnorm_gauge_basis`` / ``build_gated_mlp_gauge_basis`` helpers.
+    builder helpers.
 
     Orthonormalization across directions is *not* performed here; it is done
     lazily during projection via modified Gram-Schmidt in
     ``project_out_gauge`` / ``project_probe_matrix``.  Because each gauge
     direction is structurally sparse and the different gauge families (RMSNorm
-    vs. MLP neuron scaling) have non-overlapping support, the raw directions
-    are already very close to orthogonal, so the streaming MGS approach
-    produces numerically equivalent results.
+    vs. MLP neuron scaling vs. attention V/O vs. Q/K RoPE) have mostly
+    non-overlapping support, the raw directions are already very close to
+    orthogonal, so the streaming MGS approach produces numerically equivalent
+    results.
 
     Args:
-        model:           the transformer model.
-        spec:            FlatParamSpec describing the flat parameter space.
-        block_indices:   which block indices are in the suffix.
-        include_rmsnorm: whether to include RMSNorm gauge directions.
-        include_mlp:     whether to include gated MLP gauge directions.
-        device:          kept for API compatibility (ignored).
+        model:                    the transformer model.
+        spec:                     FlatParamSpec describing the flat parameter space.
+        block_indices:            which block indices are in the suffix.
+        include_rmsnorm:          whether to include RMSNorm gauge directions.
+        include_mlp:              whether to include gated MLP gauge directions.
+        include_attention_vo:     whether to include attention V/O GL(d_head) gauge.
+        include_attention_qk_rope: whether to include attention Q/K RoPE gauge.
+        device:                   kept for API compatibility (ignored).
 
     Returns:
         GaugeBasis with sparse direction list and labels.
@@ -500,6 +806,16 @@ def build_suffix_gauge_basis(
     if include_mlp:
         sparse_directions_with_labels.extend(
             build_gated_mlp_gauge_basis(model, spec, block_indices)
+        )
+
+    if include_attention_vo:
+        sparse_directions_with_labels.extend(
+            build_attention_vo_gauge_basis(model, spec, block_indices)
+        )
+
+    if include_attention_qk_rope:
+        sparse_directions_with_labels.extend(
+            build_attention_qk_rope_gauge_basis(model, spec, block_indices)
         )
 
     if not sparse_directions_with_labels:
@@ -764,11 +1080,17 @@ def gauge_summary(gauge_basis: GaugeBasis) -> dict:
     """
     label_counts: dict[str, int] = {}
     for label in gauge_basis.labels:
-        # Extract type prefix: "rmsnorm_gauge_..." or "mlp_neuron_gauge_..."
+        # Extract type prefix from label
         if label.startswith("rmsnorm_gauge"):
             key = "rmsnorm"
         elif label.startswith("mlp_neuron_gauge"):
             key = "mlp_neuron"
+        elif label.startswith("attn_vo_gauge"):
+            key = "attn_vo"
+        elif label.startswith("attn_qk_rope_scale"):
+            key = "attn_qk_rope_scale"
+        elif label.startswith("attn_qk_rope_rot"):
+            key = "attn_qk_rope_rot"
         else:
             key = "other"
         label_counts[key] = label_counts.get(key, 0) + 1
@@ -788,6 +1110,7 @@ def expected_gauge_dimensions(
     hidden_size: int,
     intermediate_size: int,
     num_kv_heads: int = 0,
+    d_head: int = 64,
     include_final_norm: bool = True,
 ) -> dict:
     """Compute the expected number of gauge directions analytically.
@@ -795,8 +1118,9 @@ def expected_gauge_dimensions(
     Per block:
       - 2 RMSNorm layers x hidden_size dims = 2 * hidden_size
       - 1 gated MLP x intermediate_size neurons = intermediate_size
-      - Attention V/O + Q/K scaling: 2 * num_kv_heads (not yet implemented
-        in build_gauge_basis, but counted here for theoretical reference)
+      - Attention V/O GL(d_head): num_kv_heads * d_head^2
+      - Attention Q/K RoPE (C*)^{d_head/2}: num_kv_heads * 2 * (d_head/2)
+        = num_kv_heads * d_head
 
     Plus optionally:
       - 1 final norm x hidden_size = hidden_size (if lm_head is in the spec)
@@ -805,28 +1129,39 @@ def expected_gauge_dimensions(
     """
     rmsnorm_per_block = 2 * hidden_size
     mlp_per_block = intermediate_size
-    attention_per_block = 2 * num_kv_heads
+    attn_vo_per_block = num_kv_heads * d_head * d_head
+    attn_qk_rope_per_block = num_kv_heads * d_head  # 2 * (d_head/2) per group
+    attention_per_block = attn_vo_per_block + attn_qk_rope_per_block
 
     total_rmsnorm = num_blocks * rmsnorm_per_block
     total_mlp = num_blocks * mlp_per_block
-    total_attention = num_blocks * attention_per_block
+    total_attn_vo = num_blocks * attn_vo_per_block
+    total_attn_qk_rope = num_blocks * attn_qk_rope_per_block
+    total_attention = total_attn_vo + total_attn_qk_rope
 
     if include_final_norm:
         total_rmsnorm += hidden_size
 
+    total_all = total_rmsnorm + total_mlp + total_attention
+
     return {
         "rmsnorm_per_block": rmsnorm_per_block,
         "mlp_per_block": mlp_per_block,
+        "attn_vo_per_block": attn_vo_per_block,
+        "attn_qk_rope_per_block": attn_qk_rope_per_block,
         "attention_per_block": attention_per_block,
         "total_rmsnorm": total_rmsnorm,
         "total_mlp": total_mlp,
+        "total_attn_vo": total_attn_vo,
+        "total_attn_qk_rope": total_attn_qk_rope,
         "total_attention": total_attention,
-        "total_implemented": total_rmsnorm + total_mlp,
-        "total_theoretical": total_rmsnorm + total_mlp + total_attention,
-        "total": total_rmsnorm + total_mlp,  # backward compat
+        "total_implemented": total_all,
+        "total_theoretical": total_all,
+        "total": total_all,
         "num_blocks": num_blocks,
         "hidden_size": hidden_size,
         "intermediate_size": intermediate_size,
         "num_kv_heads": num_kv_heads,
+        "d_head": d_head,
         "include_final_norm": include_final_norm,
     }

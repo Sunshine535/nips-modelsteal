@@ -1,0 +1,15 @@
+{
+  "round": 0,
+  "threadId": null,
+  "status": "in_progress",
+  "difficulty": "nightmare",
+  "reviewer": "codex_xhigh",
+  "route": "logit_completion_positive",
+  "last_score": null,
+  "last_verdict": null,
+  "score_progression": [],
+  "pending_experiments": [],
+  "timestamp": "2026-04-24T12:00:00",
+  "notes": "POSITIVE RESULT: Logit Completion (variant E) beats top-K KD by 23-28% PPL. v13 (top-20): 178→137, v14 (top-5): 190→136. MSE-based SCRD failed (root cause: representation/behavior gradient conflict). Logit Completion stays in logit space, avoids the conflict.",
+  "completed_experiments": ["v7_scrd", "v8_scrd_pretrained", "v9_scrd_long", "v10_perturb01", "v11_topk20", "v12_topk5", "v13_lc_topk20", "v14_lc_topk5"]
+}

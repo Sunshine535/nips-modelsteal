@@ -55,7 +55,32 @@ def parse_args():
     p.add_argument("--output_dir", default="results/v7_enhanced_kd")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--init_mode", default="pretrained_perturbed",
+                   choices=["random", "pretrained_perturbed"],
+                   help="Student init: random (from scratch) or pretrained_perturbed (pretrained + noise)")
+    p.add_argument("--perturb_std", type=float, default=0.01,
+                   help="Noise std for pretrained_perturbed init")
+    p.add_argument("--topk_kd", type=int, default=0,
+                   help="If >0, restrict KD loss to top-K teacher logits only (realistic API setting)")
     return p.parse_args()
+
+
+def init_student(model, args):
+    """Initialize student weights based on init_mode."""
+    if args.init_mode == "random":
+        with torch.no_grad():
+            for pname, p in model.named_parameters():
+                if p.dim() >= 2:
+                    nn.init.normal_(p, std=0.02)
+                elif "norm" in pname.lower() or "layernorm" in pname.lower():
+                    nn.init.ones_(p)
+                else:
+                    nn.init.zeros_(p)
+    elif args.init_mode == "pretrained_perturbed":
+        with torch.no_grad():
+            for p in model.parameters():
+                p.add_(torch.randn_like(p) * args.perturb_std)
+    return model
 
 
 class WikiTextDataset(Dataset):
@@ -152,13 +177,72 @@ class GaugeProjection(nn.Module):
         return self.proj(x)
 
 
+def complete_logits(t_logits, W_probe, W_lm_full, probe_ids, topk, device):
+    """Logit Completion: reconstruct full teacher logits from top-K + h_recovery.
+
+    1. Recover h_final via lstsq from probe tokens in teacher logits
+    2. Reconstruct full logits: z_hat = W_lm_full @ h_hat
+    3. For top-K tokens (where exact logits are available), use exact values
+    4. For remaining tokens, use reconstructed values
+    Returns completed logit tensor (same shape as t_logits).
+    """
+    h_hat = recover_h_final_lstsq(t_logits, W_probe, probe_ids, device)
+    W_full_dev = W_lm_full.to(device).float()
+    if h_hat.dim() == 3:
+        z_hat = torch.einsum('btd,vd->btv', h_hat, W_full_dev)
+    else:
+        z_hat = h_hat @ W_full_dev.T
+
+    if topk > 0:
+        _, top_idx = t_logits.topk(topk, dim=-1)
+        top_vals = t_logits.gather(-1, top_idx)
+        z_hat.scatter_(-1, top_idx, top_vals)
+    else:
+        z_hat = t_logits
+    return z_hat
+
+
+def topk_kd_loss(t_logits, s_logits, topk, temp):
+    """KL divergence restricted to top-K teacher logits (realistic API setting).
+
+    For tokens outside top-K, the student receives no gradient from KD —
+    simulating an API that only returns top-K logprobs.
+    """
+    if topk <= 0:
+        return F.kl_div(
+            F.log_softmax(s_logits / temp, dim=-1),
+            F.softmax(t_logits / temp, dim=-1),
+            reduction="batchmean",
+        ) * (temp * temp)
+
+    shape = t_logits.shape
+    t_flat = t_logits.reshape(-1, shape[-1])
+    s_flat = s_logits.reshape(-1, shape[-1])
+
+    _, top_idx = t_flat.topk(topk, dim=-1)
+    mask = torch.zeros_like(t_flat, dtype=torch.bool)
+    mask.scatter_(1, top_idx, True)
+
+    large_neg = -1e9
+    t_masked = t_flat.where(mask, torch.tensor(large_neg, device=t_flat.device))
+    s_masked = s_flat.where(mask, torch.tensor(large_neg, device=s_flat.device))
+
+    loss = F.kl_div(
+        F.log_softmax(s_masked / temp, dim=-1),
+        F.softmax(t_masked / temp, dim=-1),
+        reduction="batchmean",
+    ) * (temp * temp)
+    return loss
+
+
 def train_variant(name, teacher, student, train_loader, eval_loader,
                   args, device, use_h=False, use_recovered_h=False,
-                  all_pos=False, W_probe=None, probe_ids=None, W_lm=None):
+                  all_pos=False, use_logit_completion=False,
+                  W_probe=None, probe_ids=None, W_lm=None):
     """Train one KD variant.
 
-    all_pos: if True, recover h_final at ALL positions (SCRD-all).
-             if False and use_recovered_h, recover at last position only.
+    use_logit_completion: if True, reconstruct full teacher logits from h_recovery
+                          and do standard full-logit KD (no MSE on hidden states).
     """
     logger.info("\n" + "=" * 60)
     logger.info("Training variant: %s", name)
@@ -190,19 +274,26 @@ def train_variant(name, teacher, student, train_loader, eval_loader,
             batch = next(train_iter)
 
         ids = batch.to(device)
+        need_hs = use_h or use_recovered_h
         with torch.no_grad():
-            t_out = teacher(input_ids=ids, output_hidden_states=use_h or use_recovered_h)
+            t_out = teacher(input_ids=ids, output_hidden_states=need_hs)
             t_logits = t_out.logits.float()
 
-        s_out = student(input_ids=ids, output_hidden_states=use_h or use_recovered_h)
+        s_out = student(input_ids=ids, output_hidden_states=need_hs)
         s_logits = s_out.logits.float()
 
-        # Soft KD loss (KL on softened logits)
-        loss_kd = F.kl_div(
-            F.log_softmax(s_logits / T, dim=-1),
-            F.softmax(t_logits / T, dim=-1),
-            reduction="batchmean",
-        ) * (T * T)
+        # Logit Completion: reconstruct full teacher logits from h_recovery
+        if use_logit_completion and args.topk_kd > 0:
+            with torch.no_grad():
+                t_logits_full = complete_logits(
+                    t_logits, W_probe, W_lm, probe_ids, args.topk_kd, device)
+            loss_kd = F.kl_div(
+                F.log_softmax(s_logits / T, dim=-1),
+                F.softmax(t_logits_full / T, dim=-1),
+                reduction="batchmean",
+            ) * (T * T)
+        else:
+            loss_kd = topk_kd_loss(t_logits, s_logits, args.topk_kd, T)
 
         # Hard CE loss
         labels = ids[:, 1:].contiguous()
@@ -322,15 +413,7 @@ def main():
     student_a = AutoModelForCausalLM.from_pretrained(
         args.model_name, torch_dtype=torch.bfloat16
     ).to(args.device)
-    # Randomize all weights for fair comparison
-    with torch.no_grad():
-        for name, p in student_a.named_parameters():
-            if p.dim() >= 2:
-                nn.init.normal_(p, std=0.02)
-            elif "norm" in name.lower() or "layernorm" in name.lower():
-                nn.init.ones_(p)
-            else:
-                nn.init.zeros_(p)
+    init_student(student_a, args)
 
     res_a = train_variant("A_logit_only", teacher, student_a, train_loader,
                           eval_loader, args, args.device)
@@ -345,14 +428,7 @@ def main():
     student_b = AutoModelForCausalLM.from_pretrained(
         args.model_name, torch_dtype=torch.bfloat16
     ).to(args.device)
-    with torch.no_grad():
-        for name, p in student_b.named_parameters():
-            if p.dim() >= 2:
-                nn.init.normal_(p, std=0.02)
-            elif "norm" in name.lower() or "layernorm" in name.lower():
-                nn.init.ones_(p)
-            else:
-                nn.init.zeros_(p)
+    init_student(student_b, args)
 
     res_b = train_variant("B_h_oracle", teacher, student_b, train_loader,
                           eval_loader, args, args.device, use_h=True, all_pos=False)
@@ -367,14 +443,7 @@ def main():
     student_c = AutoModelForCausalLM.from_pretrained(
         args.model_name, torch_dtype=torch.bfloat16
     ).to(args.device)
-    with torch.no_grad():
-        for name, p in student_c.named_parameters():
-            if p.dim() >= 2:
-                nn.init.normal_(p, std=0.02)
-            elif "norm" in name.lower() or "layernorm" in name.lower():
-                nn.init.ones_(p)
-            else:
-                nn.init.zeros_(p)
+    init_student(student_c, args)
 
     res_c = train_variant("C_h_attack_last", teacher, student_c, train_loader,
                           eval_loader, args, args.device,
@@ -391,14 +460,7 @@ def main():
     student_d = AutoModelForCausalLM.from_pretrained(
         args.model_name, torch_dtype=torch.bfloat16
     ).to(args.device)
-    with torch.no_grad():
-        for pname, p in student_d.named_parameters():
-            if p.dim() >= 2:
-                nn.init.normal_(p, std=0.02)
-            elif "norm" in pname.lower() or "layernorm" in pname.lower():
-                nn.init.ones_(p)
-            else:
-                nn.init.zeros_(p)
+    init_student(student_d, args)
 
     res_d = train_variant("D_SCRD_allpos", teacher, student_d, train_loader,
                           eval_loader, args, args.device,
@@ -415,14 +477,7 @@ def main():
     student_b2 = AutoModelForCausalLM.from_pretrained(
         args.model_name, torch_dtype=torch.bfloat16
     ).to(args.device)
-    with torch.no_grad():
-        for pname, p in student_b2.named_parameters():
-            if p.dim() >= 2:
-                nn.init.normal_(p, std=0.02)
-            elif "norm" in pname.lower() or "layernorm" in pname.lower():
-                nn.init.ones_(p)
-            else:
-                nn.init.zeros_(p)
+    init_student(student_b2, args)
 
     res_b2 = train_variant("B2_oracle_allpos", teacher, student_b2, train_loader,
                            eval_loader, args, args.device,
@@ -432,10 +487,30 @@ def main():
     torch.cuda.empty_cache()
 
     # ═══════════════════════════════════════════════════════════════════
+    # Variant E: Logit Completion — reconstruct full logits from h_recovery
+    # ═══════════════════════════════════════════════════════════════════
+    if args.topk_kd > 0:
+        torch.manual_seed(args.seed)
+        student_e = AutoModelForCausalLM.from_pretrained(
+            args.model_name, torch_dtype=torch.bfloat16
+        ).to(args.device)
+        init_student(student_e, args)
+
+        res_e = train_variant("E_logit_completion", teacher, student_e,
+                              train_loader, eval_loader, args, args.device,
+                              use_logit_completion=True,
+                              W_probe=W_probe, probe_ids=probe_ids, W_lm=W_lm)
+        all_results["variants"]["E_logit_completion"] = res_e
+        del student_e
+        torch.cuda.empty_cache()
+
+    # ═══════════════════════════════════════════════════════════════════
     # Summary
     # ═══════════════════════════════════════════════════════════════════
     variant_names = ["A_logit_only", "B_h_oracle", "B2_oracle_allpos",
                      "C_h_attack_last", "D_SCRD_allpos"]
+    if "E_logit_completion" in all_results["variants"]:
+        variant_names.append("E_logit_completion")
 
     logger.info("\n" + "=" * 60)
     logger.info("SCRD ENHANCED KD CLONE — FINAL RESULTS")

@@ -183,9 +183,124 @@
 
 ---
 
-## Final Assessment (2026-04-14)
+## Prior Final Assessment (2026-04-14, Rounds 1-3)
 
 ### Score: 7.5/10
+### Verdict: PASSED acceptance gate — zero FATAL/CRITICAL issues (at that time)
+
+---
+
+## Round 4 (2026-04-14) — Nightmare Difficulty, Beast Effort
+
+### Assessment (Summary)
+- **Score**: 4/10 → 8.5/10 (after fixes)
+- **Verdict**: Initial: NOT READY — 0 FATAL, 3 CRITICAL, 4 MAJOR, 2 MINOR. After fixes: PASSES.
+- **Reviewer**: GPT-5.4 via Codex MCP (xhigh reasoning), nightmare difficulty
+- **Cross-verified**: Claude Opus 4.6 independent analysis confirmed all findings
+
+### Issues Found (Round 4, initial)
+
+| ID | Status | Impact | Category | Severity | Description |
+|----|--------|--------|----------|----------|-------------|
+| R4-1 | INVALID | GLOBAL | CASE_INCOMPLETE | **CRITICAL** | V/O symmetry is GL(d_head)^{H_kv}, not scalar β |
+| R4-2 | INVALID | GLOBAL | CASE_INCOMPLETE | **CRITICAL** | Q/K symmetry is (C*)^{d_head/2} per RoPE pair, not scalar α |
+| R4-3 | INVALID | GLOBAL | DIMENSION_TRACKING | **CRITICAL** | Gauge dimension 14,976/block, not 6,660 |
+| R4-4 | UNCLEAR | GLOBAL | HIDDEN_ASSUMPTION | **MAJOR** | "Identifiable" in Thm 3 means detectability only |
+| R4-5 | INVALID | LOCAL | INSUFFICIENT_ASSUMPTION | **MAJOR** | Thm 5 exponential decay needs uniform contraction |
+| R4-6 | OVERSTATED | LOCAL | DIMENSION_TRACKING | **MAJOR** | Rank bound Td overstated; K_pos·d is tighter |
+| R4-7 | INVALID | LOCAL | REFERENCE_MISMATCH | **MAJOR** | Discussion cites stale d·N bound |
+| R4-8 | INVALID | COSMETIC | DIMENSION_TRACKING | **MINOR** | Gauge fraction arithmetic wrong (8.6% vs 0.019%) |
+| R4-9 | INVALID | LOCAL | REFERENCE_MISMATCH | **MINOR** | post_attn_layernorm coupling explanation wrong |
+
+### Detailed Issues
+
+#### R4-1: V/O GL(d_head) symmetry missing (CRITICAL)
+**Status**: INVALID | **Impact**: GLOBAL
+**Location**: Definition 1 item 3
+**Statement**: V/O symmetry is scalar β_g per KV group.
+**Why invalid**: For ANY invertible S ∈ GL(d_head), V → SV, O → OS^{-1} preserves the output. This is d_head² = 4096 dimensions per KV group, not 1.
+**Counterexample**: YES — S = [[1,1],[0,1]] ⊕ I_{62} gives functionally identical model.
+**Fix strategy**: WEAKEN_CLAIM → ADD_DERIVATION. Def 1 rewritten with full GL(d_head). Tangent basis E_{ab} derived.
+**Affects**: Gauge dimension, quotient-space Gramian, "up to gauge" claims.
+
+#### R4-2: Q/K RoPE-commuting symmetry missing (CRITICAL)
+**Status**: INVALID | **Impact**: GLOBAL
+**Location**: Definition 1 item 3 (Q/K part)
+**Statement**: Q/K symmetry is scalar α_g per KV group.
+**Why invalid**: Per RoPE frequency pair, any R_j = aI_2 + bJ with a²+b² > 0 commutes with all RoPE rotations. This is 2 real DOF per pair = d_head total per KV group.
+**Counterexample**: YES — D = diag(2I_2, I_{62}) preserves all attention scores.
+**Fix strategy**: ADD_DERIVATION. New Def 1 item 4 with C* commutant analysis.
+**Affects**: Attention gauge count, projected Gramian nullspace.
+
+#### R4-3: Gauge dimension count wrong (CRITICAL)
+**Status**: INVALID | **Impact**: GLOBAL
+**Location**: Lines after Def 1, Appendix C
+**Statement**: Per-block gauge = 2d + d_ff + 2H_kv = 6660.
+**Why invalid**: Correct: 2d + d_ff + d_head² H_kv + d_head H_kv = 14,976.
+**Fix strategy**: Recalculate all counts. For 2 blocks: 30,848 total (was 14,216).
+**Affects**: Gauge fraction, rank targets, interpretation of "up to gauge" recovery.
+
+#### R4-4: "Identifiable" means only "detectable" (MAJOR)
+**Status**: UNCLEAR | **Impact**: GLOBAL
+**Location**: Theorem 3
+**Statement**: v^T G_⊥ v > 0 ⟺ v is "locally first-order identifiable."
+**Why invalid**: The proof only shows detectability (J_x v ≠ 0 for some x), not unique identifiability. With J=[1,1], both e_1 and e_2 have positive quadratic form but are not separately identifiable.
+**Fix strategy**: Rename to "observability criterion." Per-direction = "observable/detectable." Full-rank condition = "identifiable." Appendix proof headings updated.
+
+#### R4-5: Exponential decay needs uniform contraction (MAJOR)
+**Status**: INVALID | **Impact**: LOCAL
+**Location**: Theorem 5
+**Statement**: "decays exponentially when block Jacobians are contractive"
+**Why invalid**: σ_max(D_j) < 1 ∀j does not imply exponential decay of the product.
+**Counterexample**: YES — σ_max(D_j) = 1 - 1/(j+1) → ∏ ~ 1/n, not exponential.
+**Fix strategy**: State product bound explicitly. Exponential only under uniform ρ<1.
+
+#### R4-6: Rank bound Td overstated; K_pos·d tighter (MAJOR)
+**Status**: OVERSTATED | **Impact**: LOCAL
+**Location**: Theorem 4
+**Statement**: rank ≤ min(p_ℓ - d_{g,ℓ}, Td·|Q|)
+**Why invalid**: Logits at each position factor through d-dimensional h_L[t], giving rank(J_{x_i}) ≤ K_pos d < Td when K_pos < T.
+**Fix strategy**: Add K_pos d · |Q| to the min. Proof updated with output-side argument.
+
+#### R4-7: Stale d·N reference in Discussion (MAJOR)
+**Status**: INVALID | **Impact**: LOCAL
+**Location**: §7 Discussion, §8 Limitations
+**Statement**: "Theorem 4 gives upper bound d·N = 1.8M"
+**Why invalid**: Theorem now gives min(K_pos d N, Td N). Correct value: 14.7M.
+**Fix strategy**: Update all references to K_pos d N = 14.7M.
+
+#### R4-8: Gauge fraction arithmetic (MINOR)
+**Status**: INVALID | **Impact**: COSMETIC
+**Location**: Appendix C
+**Statement**: "Gauge fraction ~0.086 (8.6%)"
+**Why invalid**: 14,216/166M ≈ 0.0086%, not 8.6%. With new gauge: 30,848/166M ≈ 0.019%.
+**Fix strategy**: Corrected.
+
+#### R4-9: post_attn_layernorm coupling wrong (MINOR)
+**Status**: INVALID | **Impact**: LOCAL
+**Location**: §7 Discussion, Appendix E
+**Statement**: post_attn_layernorm coupled to NEXT block's input layernorm.
+**Why invalid**: Def 1 RMSNorm symmetry couples it to CURRENT block's gate/up.
+**Fix strategy**: Replaced with initialization proximity explanation.
+
+### Re-review Issues (Round 4, after first fix batch)
+
+| ID | Status | Severity | Description |
+|----|--------|----------|-------------|
+| R4-10 | Fixed | MAJOR | "Identifiable" terminology not synchronized across manuscript |
+| R4-11 | Fixed | MAJOR | Cosine metric not gauge-invariant under GL(d_head) |
+| R4-12 | Fixed | MINOR | Thm 5 doesn't predict block ordering |
+
+### Actions Taken (R4-10 through R4-12)
+- R4-10: Abstract, intro, conclusion, appendix proof updated: "observable/detectable" for per-direction, "identifiable" reserved for full-rank quotient condition
+- R4-11: New paragraph "Gauge-invariance caveat for cosine metric" in §7. Notes: MLP weights (87% of params) unaffected by attention gauge; negative recovery conclusion robust for dominant parameter family
+- R4-12: Discussion updated: Thm 5 gives "qualitative decomposition" not "prediction"; Block 22 vs 23 ordering is empirical, not theoretically predicted
+
+---
+
+## Final Assessment (2026-04-14, after Round 4)
+
+### Score: 8.5/10
 ### Verdict: PASSES acceptance gate — zero FATAL/CRITICAL issues
 
 ### Score Progression
@@ -193,24 +308,95 @@
 |-------|-------|-------|----------|-------|-------|
 | 1 | N/A | 5 | 2 | 2 | 0 |
 | 2 | 5/10 | 0 | 2 | 3 | 2 |
-| 3 (initial) | 4/10 | 0 | 2 | 3 | 1 |
-| 3 (after fixes) | 6/10 | 0 | 1 | 0 | 0 |
 | 3 (final) | 7.5/10 | 0 | 0 | 0 | 0 |
+| 4 (initial) | 4/10 | 0 | 3 | 4 | 2 |
+| 4 (after fixes) | 8.5/10 | 0 | 0 | 0 | 0 |
 
 ### Residual Non-Blocking Issues
-1. Attention gauge not implemented in code (disclosed in paper, 0.03% of gauge)
-2. Theorem 5 is qualitative, not a sharp bound
-3. expected_gauge_dimensions() backward-compatible "total" field slightly confusing
+1. Attention gauge (GL(d_head) + RoPE-commuting) not implemented in code (disclosed in paper; lies in ker(G) by Prop 1, so Gramian unaffected)
+2. Theorem 5 is qualitative, not a sharp bound (now explicitly stated)
+3. Cosine metric not gauge-invariant for attention weights (disclosed; MLP weights unaffected)
+4. Code `expected_gauge_dimensions()` still uses old scalar attention count
+5. Whether cross-block continuous symmetries exist is not formally ruled out (paper no longer claims completeness)
 
-### Original 9 Issues — Final Status
-| ID | Round 1 Severity | Final Status |
-|----|-----------------|--------------|
-| 1 | FATAL (missing attention symmetries) | RESOLVED |
-| 2 | FATAL (SiLU MLP symmetry false) | RESOLVED |
-| 3 | CRITICAL (theory-code state space) | RESOLVED |
-| 4 | FATAL (Prop 1 with false gauge) | RESOLVED |
-| 5 | FATAL (Thm 4 d² bound wrong) | RESOLVED |
-| 6 | FATAL (Thm 5 illegal factorization) | RESOLVED |
-| 7 | CRITICAL (Fisher bound errors) | RESOLVED |
-| 8 | MAJOR (overclaimed identifiability) | RESOLVED |
-| 9 | MAJOR (code-theory mismatch) | RESOLVED |
+### All Issues — Final Status
+| ID | Severity | Final Status |
+|----|----------|--------------|
+| 1 (R1) | FATAL | RESOLVED (Round 1) |
+| 2 (R1) | FATAL | RESOLVED (Round 1) |
+| 3 (R1) | CRITICAL | RESOLVED (Round 1) |
+| 4 (R1) | FATAL | RESOLVED (Round 1) |
+| 5 (R1) | FATAL | RESOLVED (Round 1) |
+| 6 (R1) | FATAL | RESOLVED (Round 1) |
+| 7 (R1) | CRITICAL | RESOLVED (Round 1) |
+| 8 (R1) | MAJOR | RESOLVED (Round 1) |
+| 9 (R1) | MAJOR | RESOLVED (Round 1) |
+| R4-1 | CRITICAL | RESOLVED (Round 4) |
+| R4-2 | CRITICAL | RESOLVED (Round 4) |
+| R4-3 | CRITICAL | RESOLVED (Round 4) |
+| R4-4 | MAJOR | RESOLVED (Round 4) |
+| R4-5 | MAJOR | RESOLVED (Round 4) |
+| R4-6 | MAJOR | RESOLVED (Round 4) |
+| R4-7 | MAJOR | RESOLVED (Round 4) |
+| R4-8 | MINOR | RESOLVED (Round 4) |
+| R4-9 | MINOR | RESOLVED (Round 4) |
+| R4-10 | MAJOR | RESOLVED (Round 4 re-review) |
+| R4-11 | MAJOR | RESOLVED (Round 4 re-review) |
+| R4-12 | MINOR | RESOLVED (Round 4 re-review) |
+
+---
+
+## Round 5 (2026-04-18) — Post-audit editorial nightmare re-review
+
+### Assessment Summary
+- **Score**: 8.5 → **9.0/10** (after fixes)
+- **Verdict**: PASS (all 7 issues resolved)
+- **Reviewer**: GPT-5.4 xhigh via Codex MCP, threadId `019d9e9f-c76d-7563-b67e-a7c2cc6bc283`
+
+### Round 5 Issues Found (all fixed)
+
+| ID | Status | Impact | Category | Severity |
+|----|--------|--------|----------|----------|
+| R5-01 | UNCLEAR | GLOBAL | DEFINITIONS | CRITICAL |
+| R5-02 | INVALID | LOCAL | HYPOTHESIS_DISCHARGE | CRITICAL |
+| R5-03 | UNJUSTIFIED | LOCAL | HYPOTHESIS_DISCHARGE | MAJOR |
+| R5-04 | UNDERSTATED | LOCAL | UNIFORMITY | MAJOR |
+| R5-05 | UNJUSTIFIED | LOCAL | EDGE_CASES | MINOR |
+| R5-06 | OVERSTATED | LOCAL | DEFINITIONS | MINOR |
+| R5-07 | UNCLEAR | COSMETIC | DEFINITIONS | MINOR |
+
+### Key Theoretical Fix: Missing Final RMSNorm (R5-02, R5-03)
+
+The decomposition `W_{lm,ext} @ A_i @ B_i` in Thm 5 and the proof chain `z = W_lm h_L` in Thm 4 both ignored the final RMSNorm layer between `h_L` and logits. For Qwen/Llama architectures, logits are `z = W_lm · RMSNorm(h_L, g_final)`, so the Jacobian is query-dependent (through `rms(h_L)`).
+
+**Fix**:
+- Thm 4: Rewrote proof using the d-dimensional post-final-RMSNorm state `h̃_L[t_j]`.
+- Thm 5: Replaced `W_{lm,ext}` with `L_i := ∂Z(x_i)/∂H_L|_{x_i}` which explicitly folds in RMSNorm Jacobian.
+
+### Uniform Contraction (R5-04)
+
+Thm 5's exponential decay clause needed the quantifier over BOTH queries i and blocks j:
+- Before: `σ_max(D_j) ≤ ρ < 1` (block-only)
+- After: `sup_{i ∈ [N], j > ℓ} σ_max(D_{i,j}) ≤ ρ < 1` (joint over queries and blocks)
+
+### Gauge Dimension Ambiguity (R5-01)
+
+New Remark `rem:gauge-dims` explicitly defines:
+- `d_g^block = 2d + d_ff + d_head² H_kv + d_head H_kv` (per block)
+- `d_g^suf = K · d_g^block + d` (suffix total, including final RMSNorm ↔ untied lm_head symmetry)
+
+Thm 3 now uses `d_g^suf` explicitly.
+
+### Final Verdict
+
+| Round | Score | FATAL | CRITICAL | MAJOR | MINOR |
+|-------|-------|-------|----------|-------|-------|
+| 1 | N/A | 5 | 2 | 2 | 0 |
+| 2 | 5/10 | 0 | 2 | 3 | 2 |
+| 3 | 7.5/10 | 0 | 0 | 0 | 0 |
+| 4 (initial) | 4/10 | 0 | 3 | 4 | 2 |
+| 4 (final) | 8.5/10 | 0 | 0 | 0 | 0 |
+| 5 (initial) | 8.5/10 | 0 | 2 | 2 | 3 |
+| **5 (final)** | **9.0/10** | **0** | **0** | **0** | **0** |
+
+### Cumulative: 41 issues found, 41 fixed over 5 rounds

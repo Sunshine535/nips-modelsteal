@@ -1,8 +1,10 @@
-# Research Proposal: S-PSI — How Identifiable Are Transformer Weights from Logits?
+# FINAL PROPOSAL: Side-Channel Representation Distillation (SCRD)
+
+*Updated 2026-04-24 — supersedes S-PSI proposal*
 
 ## Problem Anchor
-- **Bottom-line problem**: Can we recover actual internal weight parameters of a black-box LLM from output logits?
-- **Must-solve bottleneck**: No method studies whether weight recovery is IDENTIFIABLE from logits, let alone achieves it.
+- **Bottom-line problem**: Black-box model stealing via KD is limited to logit-level supervision (Clone 2025: 7.31% ppl degradation). The teacher's internal representations carry richer information but are inaccessible in black-box settings.
+- **Must-solve bottleneck**: The logit_bias API parameter, combined with least-squares recovery, recovers the teacher's final hidden state h_final at cos 0.977 per query. This recovered representation can serve as dense supervision for knowledge distillation.
 - **Non-goals**: Not KD, not data extraction, not attacking production APIs.
 - **Constraints**: 8x A100-80GB, ~450 GPU-hours, Qwen3.5-0.6B primary, NeurIPS 2026.
 - **Success condition**: Under boundary-state oracle, last 1-2 blocks recoverable (per-matrix cos_sim > 0.9, consistent across 5 random inits). Characterize degradation under pure-logits.
