@@ -1,0 +1,129 @@
+{
+  "timestamp": "2026-04-25T05:07:09",
+  "git_hash": "ef1f71d298f0",
+  "python_version": "3.10.12",
+  "command": "scripts/run_qumc.py --config configs/qumc_minimal_strict.yaml --seeds 0 1 2 --output_dir results/qumc_minimal_strict_v2",
+  "config": {
+    "model_name": "Qwen/Qwen2.5-0.5B",
+    "num_steps": 5000,
+    "batch_size": 8,
+    "seq_len": 128,
+    "lr": 2e-05,
+    "kd_temp": 2.0,
+    "kd_alpha": 0.7,
+    "topk": 20,
+    "probe_tokens": 2000,
+    "heldout_probe_tokens": 500,
+    "cal_examples": 200,
+    "carlini_examples": 100,
+    "max_probe_budget": -1,
+    "eval_every": 500,
+    "eval_batches": 50,
+    "output_dir": "results/qumc_minimal_strict_v2",
+    "device": "cuda:0",
+    "seed": 42,
+    "seeds": [
+      0,
+      1,
+      2
+    ],
+    "perturb_std": 0.01,
+    "basis_source": "carlini_recovered",
+    "allow_synthetic": false,
+    "dry_run": false,
+    "variants": [
+      "strict_topk_kd",
+      "completion_no_unc_strict",
+      "completion_uncertainty_strict",
+      "full_logit_upper",
+      "old_lc_simulator"
+    ],
+    "config": "configs/qumc_minimal_strict.yaml"
+  },
+  "seed": 1,
+  "model_name": "Qwen/Qwen2.5-0.5B",
+  "dataset": "wikitext-103-raw-v1/train",
+  "split_info": {
+    "train": "wikitext-103-raw-v1/train",
+    "eval": "wikitext-103-raw-v1/validation",
+    "train_samples": 49700,
+    "cal_samples": 200,
+    "eval_samples": 2000
+  },
+  "query_budget": {
+    "topk_queries": 120100,
+    "probe_queries": 160020000,
+    "total_queries": 160140100,
+    "max_probe_budget": -1
+  },
+  "metrics": {
+    "strict_topk_kd": {
+      "kl": 3.30933247089386,
+      "top1": 0.40529527425765993,
+      "ppl": 414.8039566547382,
+      "ce": 6.027806015014648
+    },
+    "completion_no_unc_strict": {
+      "kl": 11.069462547302246,
+      "top1": 0.002106299204751849,
+      "ppl": 568050.5372202258,
+      "ce": 13.24996566772461
+    },
+    "completion_uncertainty_strict": {
+      "kl": 2.5216608905792235,
+      "top1": 0.38027559041976927,
+      "ppl": 145.22917225379462,
+      "ce": 4.978312993049622
+    },
+    "full_logit_upper": {
+      "kl": 2.149820067882538,
+      "top1": 0.3828149592876434,
+      "ppl": 138.05681590794927,
+      "ce": 4.927665309906006
+    },
+    "old_lc_simulator": {
+      "kl": 11.069462547302246,
+      "top1": 0.002106299204751849,
+      "ppl": 568050.5372202258,
+      "ce": 13.24996566772461
+    }
+  },
+  "basis": {
+    "source": "carlini_recovered",
+    "access_level": "strict_black_box",
+    "n_queries_used_in_recovery": 100,
+    "notes": "Recovered from 100 top-K queries via Gram-trick SVD (N=12800, V=151936); W_eff \u2248 W_lm @ A (gauge ambiguity)."
+  },
+  "calibration_budget": {
+    "topk_queries": 0,
+    "probe_queries": 20000
+  },
+  "variant_budgets": {
+    "strict_topk_kd": {
+      "topk_queries": 40000,
+      "probe_queries": 0
+    },
+    "completion_no_unc_strict": {
+      "topk_queries": 40000,
+      "probe_queries": 80000000
+    },
+    "completion_uncertainty_strict": {
+      "topk_queries": 40000,
+      "probe_queries": 80000000
+    },
+    "full_logit_upper": {
+      "topk_queries": 0,
+      "probe_queries": 0
+    },
+    "old_lc_simulator": {
+      "topk_queries": 0,
+      "probe_queries": 0
+    }
+  },
+  "evaluation_full_logits_used_for_metrics": true,
+  "strict_access_audit": {
+    "teacher_wlm_used_as_basis": false,
+    "calibration_uses_probes_only": true,
+    "unified_kl_loss": true
+  }
+}
