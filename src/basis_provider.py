@@ -58,48 +58,63 @@ class BasisProvider:
     @staticmethod
     def carlini_recover(api, input_ids_batches, d: int, V: int,
                         device: str = "cuda:0") -> Basis:
-        """Recover W_eff from top-K logit observations via SVD.
+        """Recover W_eff from top-K logit observations via SVD (Gram trick).
 
-        Collects logits from `input_ids_batches` through the top-K oracle
-        (for the top-K positions only, with -inf elsewhere), stacks them,
-        and takes the top-d right singular vectors as W_eff^T.
+        Carlini et al. 2024: stack observed logit vectors Z ∈ R^{N×V}, then
+        take the top-d right singular vectors as W_eff^T. For large V we
+        cannot form V×V. Instead, if N ≤ V, use the Gram trick:
+          Z Z^T = U Σ² U^T  (N×N eigendecomposition)
+          V_col_i = Z^T U_i / σ_i
+        This gives the same top-d right singular vectors without materializing V×V.
 
-        Per Carlini et al. 2024: this recovers W_lm up to an invertible
-        right-hand gauge A (W_eff ≈ W_lm @ A), which is the known
-        second-order identifiability barrier.
+        Memory: Z is (N, V) fp32 on CPU; Z Z^T is (N, N) fp32.
         """
         n_queries = 0
-        Z_rows = []
+        Z_rows_cpu = []
         for batch in input_ids_batches:
             topk_vals, topk_idx, logit_shape = api.get_topk(batch)
             B, T, K = topk_vals.shape
             V_ = logit_shape[-1]
-            z_sparse = torch.full((B * T, V_), float("-inf"), device=device)
-            vals_flat = topk_vals.reshape(B * T, K)
-            idx_flat = topk_idx.reshape(B * T, K)
+            vals_flat = topk_vals.reshape(B * T, K).float()
+            idx_flat = topk_idx.reshape(B * T, K).long()
+            mean_val = vals_flat.mean().item()
+            z_sparse = torch.full((B * T, V_), mean_val,
+                                   device=device, dtype=torch.float32)
             z_sparse.scatter_(-1, idx_flat, vals_flat)
-            finite_mask = torch.isfinite(z_sparse).all(dim=-1)
-            if finite_mask.any():
-                Z_rows.append(z_sparse[finite_mask])
-            else:
-                mean_val = vals_flat.mean().item()
-                z_sparse = torch.where(torch.isinf(z_sparse),
-                                       torch.full_like(z_sparse, mean_val),
-                                       z_sparse)
-                Z_rows.append(z_sparse)
+            Z_rows_cpu.append(z_sparse.cpu())
+            del z_sparse
+            torch.cuda.empty_cache()
             n_queries += B
-        Z = torch.cat(Z_rows, dim=0)
+
+        Z = torch.cat(Z_rows_cpu, dim=0)
+        N = Z.shape[0]
         col_mean = Z.mean(dim=0, keepdim=True)
-        Z = Z - col_mean
-        U, S, Vh = torch.linalg.svd(Z.float(), full_matrices=False)
-        W_eff = Vh[:d, :].T
+        Z.sub_(col_mean)
+
+        if N < V:
+            gram = Z @ Z.T
+            eigvals, U = torch.linalg.eigh(gram.double())
+            idx_sort = torch.argsort(eigvals, descending=True)
+            d_eff = min(d, N)
+            top_idx = idx_sort[:d_eff]
+            sigmas = torch.sqrt(eigvals[top_idx].clamp(min=1e-12))
+            U_top = U[:, top_idx].float()
+            W_eff = (Z.T @ U_top) / sigmas.float().unsqueeze(0)
+            if d_eff < d:
+                pad = torch.zeros(V, d - d_eff, dtype=W_eff.dtype)
+                W_eff = torch.cat([W_eff, pad], dim=1)
+        else:
+            _, _, Vh = torch.linalg.svd(Z, full_matrices=False)
+            W_eff = Vh[:d, :].T
+
+        del Z
         return Basis(
             W=W_eff,
             source="carlini_recovered",
             access_level="strict_black_box",
             n_queries_used=n_queries,
-            notes=f"Recovered from {n_queries} top-K queries via SVD of full-vocab "
-                  f"sparse-top-K matrix (centered); W_eff ≈ W_lm @ A (gauge ambiguity)."
+            notes=f"Recovered from {n_queries} top-K queries via Gram-trick SVD "
+                  f"(N={N}, V={V}); W_eff ≈ W_lm @ A (gauge ambiguity)."
         )
 
     @staticmethod
