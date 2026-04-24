@@ -263,6 +263,8 @@ def main():
         for k, v in cfg.items():
             if hasattr(args, k):
                 setattr(args, k, v)
+        for attr in ("lr", "kd_temp", "kd_alpha", "perturb_std"):
+            setattr(args, attr, float(getattr(args, attr)))
 
     if args.dry_run:
         logger.info("DRY RUN — planned variants: %s", args.variants)

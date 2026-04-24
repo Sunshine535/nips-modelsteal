@@ -3,7 +3,7 @@ model_name: "Qwen/Qwen2.5-0.5B"
 num_steps: 2
 batch_size: 1
 seq_len: 16
-lr: 2e-5
+lr: 0.00002
 kd_temp: 2.0
 kd_alpha: 0.7
 topk: 5
