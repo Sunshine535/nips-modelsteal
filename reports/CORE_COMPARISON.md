@@ -1,5 +1,17 @@
 # Core Comparison: A/B/C Triad
 
+> **⚠️ STATUS: INVALIDATED by GPT-5.5 Pro R2 Review (2026-04-25).**
+> 
+> Four critical issues identified:
+> 1. Variants B and C use teacher `lm_head.weight` directly as completion basis (NOT strict black-box).
+> 2. Calibration uses validation full logits on `eval_loader` (access leak + validation data leakage).
+> 3. KD loss normalization differs between B/D (`batchmean`) and C (token-mean) by ~128× for seq_len=128.
+> 4. C's PPL improvement over B may be artifact of CE-dominance from KD downweighting; C's **KL is WORSE than B** (mean 2.18 vs 2.09).
+>
+> This comparison is re-classified as **ORACLE_WLM_AND_CALIBRATION_LEAK_WEAK_SIGNAL**. Raw data in `results/qumc_minimal/` is preserved.
+> See `reports/GPT55_R2_REVIEW_RESPONSE.md` for full details. Re-run required after Tasks 2-7 per R2.
+
+
 ## Setup
 - Model: Qwen/Qwen2.5-0.5B (teacher = student architecture)
 - Init: pretrained + noise(σ=0.01)

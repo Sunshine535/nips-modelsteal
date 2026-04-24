@@ -7,6 +7,7 @@ This file classifies all experimental results by reliability and usability for c
 | Result | Source | Reason | Date Invalidated |
 |--------|--------|--------|-----------------|
 | Active-query cos≈0.999 | `findings.md`, old active-query runs | BUG CONFIRMED: student initialized with teacher weights | 2026-04-19 |
+| qumc_minimal C>B>A "strict black-box Q-UMC" | `results/qumc_minimal/`, `reports/CORE_COMPARISON.md` v1 | **ORACLE_WLM_AND_CALIBRATION_LEAK_WEAK_SIGNAL** — B/C use teacher `lm_head.weight` as completion basis; calibration uses validation full logits; KD loss normalization inconsistent between B and C (~128× scale diff); C mean KL=2.18 WORSE than B mean KL=2.09. Raw JSON preserved but re-interpreted as weak PPL signal under oracle-teacher-W + oracle-calibration, NOT strict Q-UMC validation. See `reports/GPT55_R2_REVIEW_RESPONSE.md`. | 2026-04-25 |
 
 ## SIMULATOR-POSITIVE (signal present but not strict black-box)
 

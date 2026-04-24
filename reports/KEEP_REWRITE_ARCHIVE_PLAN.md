@@ -2,7 +2,7 @@
 
 | Item | Path | Current Role | Evidence | Action | Reason | Risk |
 |------|------|--------------|----------|--------|--------|------|
-| Strict Q-UMC trainer | scripts/run_qumc.py | New main method | 3-seed positive | KEEP | Main method, validated | None |
+| Q-UMC trainer (R1) | scripts/run_qumc.py | Not-yet-strict main path | 3-seed weak-signal only | REWRITE per R2 | R2 found teacher W_lm leak, cal leakage, loss scale bug | Cannot claim strict black-box yet |
 | Oracle abstraction | src/oracles.py | New core module | Tests pass | KEEP | Required for strict black-box | None |
 | Logit completer | src/logit_completion.py | New core module | Tests pass, C>A | KEEP | Required for Q-UMC | None |
 | Result manifest | src/result_manifest.py | Provenance | Used in every run | KEEP | Required for reproducibility | None |

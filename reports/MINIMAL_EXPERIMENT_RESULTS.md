@@ -1,5 +1,10 @@
 # Minimal Experiment Results
 
+> **⚠️ GPT-5.5 Pro R2 RE-VERDICT (2026-04-25): INVALID for strict Q-UMC claim.**
+> Tagged as `ORACLE_WLM_AND_CALIBRATION_LEAK_WEAK_SIGNAL`.
+> Tasks 2-7 per R2 must be completed before re-running as `qumc_minimal_strict_v2`.
+
+
 | Experiment | Command | Config | Dataset | Seed | Metric | Result | Expected | Pass/Fail | Interpretation |
 |------------|---------|--------|---------|------|--------|--------|----------|-----------|----------------|
 | Smoke test | `python scripts/run_qumc.py --num_steps 2 --batch_size 1 --seq_len 16 --topk 5 --probe_tokens 64 --allow_synthetic` | qumc_smoke | synthetic | 42 | crash/complete | No crash, manifest saved | completes | PASS | Code runs end-to-end on GPU |

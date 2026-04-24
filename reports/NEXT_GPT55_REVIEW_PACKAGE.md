@@ -88,5 +88,5 @@ NOT YET TESTED: Whether the signal survives strict oracle removal.
 1. Code review of `src/oracles.py` — is the strict separation actually enforced?
 2. Code review of `src/logit_completion.py` — is the uncertainty calibration principled?
 3. After GPU results: `results/qumc_minimal/` A/B/C comparison tables
-4. If C > A and C > B over 3 seeds → method validated
+4. If C > A and C > B over 3 seeds AND under strict oracle with unified loss and disjoint calibration split → method validated (NOTE: R1 run failed this test; see R2 response)
 5. If C ≤ A → method fails, prepare negative report

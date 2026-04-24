@@ -1,0 +1,24 @@
+# Smoke test for R2-compliant strict Q-UMC
+model_name: "Qwen/Qwen2.5-0.5B"
+num_steps: 2
+batch_size: 1
+seq_len: 16
+lr: 0.00002
+kd_temp: 2.0
+kd_alpha: 0.7
+topk: 5
+probe_tokens: 32
+heldout_probe_tokens: 16
+cal_examples: 4
+carlini_examples: 8
+eval_every: 2
+eval_batches: 1
+perturb_std: 0.01
+max_probe_budget: -1
+basis_source: "carlini_recovered"
+allow_synthetic: true
+variants:
+  - strict_topk_kd
+  - completion_no_unc_strict
+  - completion_uncertainty_strict
+  - full_logit_upper
