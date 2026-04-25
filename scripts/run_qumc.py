@@ -224,6 +224,9 @@ def train_variant(name, teacher_api, completer, student, train_loader,
     is_old_simulator_oracle = (name == "old_lc_simulator_teacherW")
     is_ce_only = (name == "ce_only")
     is_topk_tailzero = (name == "strict_topk_weighted_tailzero")
+    is_probe_dense = (name == "probe_dense_kd")
+    is_topk_plus_probe = (name == "topk_plus_probe_kd")
+    use_probe_normalize = is_probe_dense or is_topk_plus_probe or is_topk_tailzero
 
     probe_ids = completer.probe_ids.cpu() if completer is not None else None
 
@@ -256,8 +259,23 @@ def train_variant(name, teacher_api, completer, student, train_loader,
 
         weights = None
         topk_idx = None
+        _probe_kd_override = None
         if is_ce_only:
             t_logits = None
+        elif is_probe_dense:
+            probe_logits_3d = teacher_api.get_probe_logits(ids, probe_ids.to(device))
+            t_logits = None
+            _probe_kd_override = ("probe_only", probe_logits_3d, probe_ids)
+        elif is_topk_plus_probe:
+            topk_vals, topk_idx, logit_shape = teacher_api.get_topk(ids)
+            probe_logits_3d = teacher_api.get_probe_logits(ids, probe_ids.to(device))
+            V = logit_shape[-1]
+            all_ids = torch.cat([probe_ids.to(device),
+                                  topk_idx.reshape(-1, topk_idx.shape[-1])[0]])
+            all_ids = all_ids.unique()
+            t_logits = None
+            _probe_kd_override = ("topk_plus_probe", probe_logits_3d, probe_ids,
+                                   topk_vals, topk_idx, logit_shape)
         elif is_full_logit:
             t_logits = teacher_api.get_full_logits_ORACLE_ONLY(ids)
         elif is_old_simulator or is_old_simulator_oracle:
@@ -299,12 +317,53 @@ def train_variant(name, teacher_api, completer, student, train_loader,
         if is_ce_only:
             loss_kd = torch.tensor(0.0, device=device)
             loss = loss_ce
+        elif _probe_kd_override is not None:
+            T_kd = args.kd_temp
+            if _probe_kd_override[0] == "probe_only":
+                _, t_probe, p_ids = _probe_kd_override
+                s_probe = s_logits[:, :, p_ids.to(device)].float()
+                t_probe = t_probe.float()
+                loss_kd = F.kl_div(
+                    F.log_softmax(s_probe / T_kd, dim=-1),
+                    F.softmax(t_probe / T_kd, dim=-1),
+                    reduction="batchmean",
+                ) * (T_kd * T_kd)
+            else:
+                _, t_probe, p_ids, tk_vals, tk_idx, lshape = _probe_kd_override
+                V = lshape[-1]
+                observed_ids = torch.cat([p_ids.to(device),
+                                          tk_idx.reshape(-1, tk_idx.shape[-1])[0]])
+                observed_ids = observed_ids.unique()
+                t_observed = torch.zeros(B, seq, len(observed_ids), device=device)
+                s_observed = torch.zeros(B, seq, len(observed_ids), device=device)
+                for j, vid in enumerate(observed_ids):
+                    t_col = torch.zeros(B, seq, device=device)
+                    s_col = s_logits[:, :, vid].float()
+                    pid_match = (p_ids.to(device) == vid).nonzero(as_tuple=True)
+                    if len(pid_match[0]) > 0:
+                        t_col = t_probe[:, :, pid_match[0][0]]
+                    for b_i in range(B):
+                        tk_match = (tk_idx[b_i] == vid).any(dim=-1)
+                        if tk_match.any():
+                            pos_mask = tk_match
+                            local_idx = (tk_idx[b_i] == vid).float().argmax(dim=-1)
+                            t_col[b_i, pos_mask] = tk_vals[b_i, pos_mask].gather(
+                                -1, local_idx[pos_mask].unsqueeze(-1)).squeeze(-1)
+                    t_observed[:, :, j] = t_col
+                    s_observed[:, :, j] = s_col
+                loss_kd = F.kl_div(
+                    F.log_softmax(s_observed / T_kd, dim=-1),
+                    F.softmax(t_observed / T_kd, dim=-1),
+                    reduction="batchmean",
+                ) * (T_kd * T_kd)
+            loss = args.kd_alpha * loss_kd + (1 - args.kd_alpha) * loss_ce
         else:
             t_logits = t_logits.float()
+            should_normalize = use_normalized_kl
             loss_kd = sequence_kl_loss(s_logits, t_logits,
                                         weights=weights,
                                         temperature=args.kd_temp,
-                                        normalize_by_weight_mass=use_normalized_kl)
+                                        normalize_by_weight_mass=should_normalize)
             loss = args.kd_alpha * loss_kd + (1 - args.kd_alpha) * loss_ce
 
         optimizer.zero_grad()
