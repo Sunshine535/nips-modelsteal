@@ -1,0 +1,183 @@
+{
+  "rows": [
+    {
+      "method": "Carlini 2024",
+      "model": "Llama-3.2-1B",
+      "attack_target": "lm_head",
+      "pure_logits": true,
+      "w_lm_cos": 0.9856664538383484,
+      "w_down_cos": null,
+      "hidden_geom_match": null,
+      "elapsed_seconds": 357.72,
+      "extra": {
+        "subspace_cos": 0.9856456518173218,
+        "d_hat": 2046,
+        "d_true": 2048
+      }
+    },
+    {
+      "method": "Clone 2025 (L=16)",
+      "model": "Llama-3.2-1B",
+      "attack_target": "lm_head + distill",
+      "pure_logits": true,
+      "w_lm_cos": 0.9856456518173218,
+      "w_down_cos": null,
+      "hidden_geom_match": 0.7918429970741272,
+      "elapsed_seconds": 702.24,
+      "extra": {
+        "student_layers": 16,
+        "teacher_layers": 16,
+        "perplexity_increase_pct": -86.01372182976345
+      }
+    },
+    {
+      "method": "Clone 2025 (L=24)",
+      "model": "Qwen2.5-0.5B",
+      "attack_target": "lm_head + distill",
+      "pure_logits": true,
+      "w_lm_cos": 0.9999738335609436,
+      "w_down_cos": null,
+      "hidden_geom_match": 0.6828669905662537,
+      "elapsed_seconds": 535.95,
+      "extra": {
+        "student_layers": 24,
+        "teacher_layers": 24,
+        "perplexity_increase_pct": -84.17549920111882
+      }
+    },
+    {
+      "method": "Ours (pure-logits algebraic)",
+      "model": "Qwen2.5-0.5B",
+      "attack_target": "lm_head + h_L (algebraic)",
+      "pure_logits": true,
+      "w_lm_cos": null,
+      "w_down_cos": null,
+      "hidden_geom_match": null,
+      "elapsed_seconds": null,
+      "extra": {}
+    },
+    {
+      "method": "Ours (pure-logits SPSI, s123)",
+      "model": "Qwen2.5-0.5B",
+      "attack_target": "lm_head + h_L",
+      "pure_logits": true,
+      "w_lm_cos": -0.01216062717139721,
+      "w_down_cos": 0.0008268066449090838,
+      "hidden_geom_match": null,
+      "elapsed_seconds": null,
+      "extra": {
+        "total_queries": 167544
+      }
+    },
+    {
+      "method": "Ours (pure-logits SPSI, s42)",
+      "model": "Qwen2.5-0.5B",
+      "attack_target": "lm_head + h_L",
+      "pure_logits": true,
+      "w_lm_cos": 0.004567088559269905,
+      "w_down_cos": -0.0003799339756369591,
+      "hidden_geom_match": null,
+      "elapsed_seconds": null,
+      "extra": {
+        "total_queries": 216144
+      }
+    },
+    {
+      "method": "Ours (pure-logits SPSI, s777)",
+      "model": "Qwen2.5-0.5B",
+      "attack_target": "lm_head + h_L",
+      "pure_logits": true,
+      "w_lm_cos": -0.0020893781911581755,
+      "w_down_cos": 0.0004629527684301138,
+      "hidden_geom_match": null,
+      "elapsed_seconds": null,
+      "extra": {
+        "total_queries": 271800
+      }
+    },
+    {
+      "method": "Ours (pure-logits SPSI, s999)",
+      "model": "Qwen2.5-0.5B",
+      "attack_target": "lm_head + h_L",
+      "pure_logits": true,
+      "w_lm_cos": -0.00765993632376194,
+      "w_down_cos": 0.0001455106248613447,
+      "hidden_geom_match": null,
+      "elapsed_seconds": null,
+      "extra": {
+        "total_queries": 393264
+      }
+    },
+    {
+      "method": "Ours (oracle algebraic W_down)",
+      "model": "Qwen2.5-0.5B",
+      "attack_target": "lm_head + W_down",
+      "pure_logits": false,
+      "w_lm_cos": null,
+      "w_down_cos": 0.6182474493980408,
+      "hidden_geom_match": 0.8829259872436523,
+      "elapsed_seconds": 898.1,
+      "extra": {
+        "W_down_per_row_cos": 0.6563228964805603,
+        "W_gate_aligned_cos": 0.02928597293794155,
+        "W_up_aligned_cos": 2.7079413484898396e-05
+      }
+    },
+    {
+      "method": "Ours (oracle algebraic W_down)",
+      "model": "llama32_1b",
+      "attack_target": "lm_head + W_down",
+      "pure_logits": false,
+      "w_lm_cos": null,
+      "w_down_cos": null,
+      "hidden_geom_match": null,
+      "elapsed_seconds": 140.0,
+      "extra": {}
+    },
+    {
+      "method": "Ours (oracle algebraic W_down)",
+      "model": "qwen25_05b",
+      "attack_target": "lm_head + W_down",
+      "pure_logits": false,
+      "w_lm_cos": null,
+      "w_down_cos": null,
+      "hidden_geom_match": null,
+      "elapsed_seconds": 56.1,
+      "extra": {}
+    },
+    {
+      "method": "Ours (oracle algebraic W_down)",
+      "model": "qwen35_08b",
+      "attack_target": "lm_head + W_down",
+      "pure_logits": false,
+      "w_lm_cos": null,
+      "w_down_cos": null,
+      "hidden_geom_match": null,
+      "elapsed_seconds": 87.4,
+      "extra": {}
+    },
+    {
+      "method": "Ours (oracle algebraic W_down)",
+      "model": "qwen35_9b",
+      "attack_target": "lm_head + W_down",
+      "pure_logits": false,
+      "w_lm_cos": null,
+      "w_down_cos": null,
+      "hidden_geom_match": null,
+      "elapsed_seconds": 450.2,
+      "extra": {}
+    },
+    {
+      "method": "Ours (oracle algebraic W_down)",
+      "model": "Llama-3.2-1B",
+      "attack_target": "lm_head + W_down",
+      "pure_logits": false,
+      "w_lm_cos": null,
+      "w_down_cos": null,
+      "hidden_geom_match": null,
+      "elapsed_seconds": null,
+      "extra": {}
+    }
+  ],
+  "n_rows": 14
+}

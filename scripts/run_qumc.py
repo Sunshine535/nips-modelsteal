@@ -215,9 +215,15 @@ def train_variant(name, teacher_api, completer, student, train_loader,
 
     is_full_logit = (name == "full_logit_upper")
     use_completion = name in ("completion_no_unc_strict",
-                              "completion_uncertainty_strict")
-    use_uncertainty = (name == "completion_uncertainty_strict")
+                              "completion_uncertainty_strict",
+                              "completion_uncertainty_normed_kl")
+    use_uncertainty = name in ("completion_uncertainty_strict",
+                                "completion_uncertainty_normed_kl")
+    use_normalized_kl = (name == "completion_uncertainty_normed_kl")
     is_old_simulator = (name == "old_lc_simulator")
+    is_old_simulator_oracle = (name == "old_lc_simulator_teacherW")
+    is_ce_only = (name == "ce_only")
+    is_topk_tailzero = (name == "strict_topk_weighted_tailzero")
 
     probe_ids = completer.probe_ids.cpu() if completer is not None else None
 
@@ -249,9 +255,12 @@ def train_variant(name, teacher_api, completer, student, train_loader,
         B, seq = ids.shape
 
         weights = None
-        if is_full_logit:
+        topk_idx = None
+        if is_ce_only:
+            t_logits = None
+        elif is_full_logit:
             t_logits = teacher_api.get_full_logits_ORACLE_ONLY(ids)
-        elif is_old_simulator:
+        elif is_old_simulator or is_old_simulator_oracle:
             t_logits_full = teacher_api.get_full_logits_ORACLE_ONLY(ids)
             V = t_logits_full.shape[-1]
             z_probe_leaked = t_logits_full[:, :, probe_ids.to(device)]
@@ -268,6 +277,13 @@ def train_variant(name, teacher_api, completer, student, train_loader,
             V = logit_shape[-1]
             if use_uncertainty and completer.uncertainty_weights is not None:
                 weights = completer.get_weights(topk_idx, V)
+        elif is_topk_tailzero:
+            topk_vals, topk_idx, logit_shape = teacher_api.get_topk(ids)
+            V = logit_shape[-1]
+            t_logits = torch.zeros((B, seq, V), device=device)
+            t_logits.scatter_(-1, topk_idx, topk_vals)
+            weights = torch.zeros((B, seq, V), device=device)
+            weights.scatter_(-1, topk_idx, 1.0)
         else:
             topk_vals, topk_idx, logit_shape = teacher_api.get_topk(ids)
             V = logit_shape[-1]
@@ -277,13 +293,19 @@ def train_variant(name, teacher_api, completer, student, train_loader,
 
         s_out = student(input_ids=ids)
         s_logits = s_out.logits.float()
-        t_logits = t_logits.float()
 
-        loss_kd = sequence_kl_loss(s_logits, t_logits,
-                                    weights=weights, temperature=args.kd_temp)
         loss_ce = sequence_ce_loss(s_logits, ids)
 
-        loss = args.kd_alpha * loss_kd + (1 - args.kd_alpha) * loss_ce
+        if is_ce_only:
+            loss_kd = torch.tensor(0.0, device=device)
+            loss = loss_ce
+        else:
+            t_logits = t_logits.float()
+            loss_kd = sequence_kl_loss(s_logits, t_logits,
+                                        weights=weights,
+                                        temperature=args.kd_temp,
+                                        normalize_by_weight_mass=use_normalized_kl)
+            loss = args.kd_alpha * loss_kd + (1 - args.kd_alpha) * loss_ce
 
         optimizer.zero_grad()
         loss.backward()
@@ -295,10 +317,9 @@ def train_variant(name, teacher_api, completer, student, train_loader,
             mech_log["kd_mean"].append(float(loss_kd.item()))
             mech_log["ce_mean"].append(float(loss_ce.item()))
             mech_log["kd_ce_ratio"].append(float(loss_kd.item() / (loss_ce.item() + 1e-8)))
-            if weights is not None:
+            if weights is not None and topk_idx is not None:
                 tail_mask = torch.ones_like(weights)
-                if "topk_idx" in locals():
-                    tail_mask.scatter_(-1, topk_idx, 0.0)
+                tail_mask.scatter_(-1, topk_idx, 0.0)
                 tail_w = (weights * tail_mask).sum() / (tail_mask.sum() + 1e-8)
                 mech_log["weight_mean_on_tail"].append(float(tail_w.item()))
 

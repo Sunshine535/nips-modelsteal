@@ -40,6 +40,24 @@ def test_kl_matches_manual_3d_formula():
     assert torch.allclose(ours, manual, atol=1e-5)
 
 
+def test_normalize_by_weight_mass_preserves_kd_scale():
+    """When weights are sparse (mostly zero), normalize_by_weight_mass=True
+    preserves the per-token KD magnitude."""
+    torch.manual_seed(2)
+    s = torch.randn(2, 5, 100)
+    t = torch.randn(2, 5, 100)
+    sparse_w = torch.zeros_like(s)
+    sparse_w[:, :, :5] = 1.0  # only top-5 active
+
+    unnorm = sequence_kl_loss(s, t, weights=sparse_w,
+                              temperature=1.0, normalize_by_weight_mass=False)
+    normed = sequence_kl_loss(s, t, weights=sparse_w,
+                              temperature=1.0, normalize_by_weight_mass=True)
+    assert normed.item() > unnorm.item() * 5, (
+        f"Normalized weighted KL should be ~weight_density^-1 larger than "
+        f"unnormalized when weights are sparse (5/100). Got {normed.item()} vs {unnorm.item()}")
+
+
 def test_ce_loss_shape_and_direction():
     s = torch.randn(2, 10, 50)
     labels = torch.randint(0, 50, (2, 10))

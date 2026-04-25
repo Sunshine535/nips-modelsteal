@@ -14,14 +14,18 @@ import torch.nn.functional as F
 def sequence_kl_loss(student_logits: torch.Tensor,
                      teacher_logits: torch.Tensor,
                      weights: torch.Tensor = None,
-                     temperature: float = 2.0) -> torch.Tensor:
+                     temperature: float = 2.0,
+                     normalize_by_weight_mass: bool = False) -> torch.Tensor:
     """KL(teacher || student) summed over vocabulary, averaged over (batch, time).
 
     Args:
-        student_logits: (B, T, V) student logits
-        teacher_logits: (B, T, V) teacher logits (the "target" distribution)
-        weights: (B, T, V) or None. Per-token weights. If None, uses uniform 1.
-        temperature: softmax temperature (returns T^2 scaled KD per Hinton 2015)
+        student_logits: (B, T, V)
+        teacher_logits: (B, T, V)
+        weights: (B, T, V) or None. Per-token weights. If None, uniform 1.
+        temperature: softmax temperature (T^2 scaled per Hinton 2015)
+        normalize_by_weight_mass: if True, divide per-token KL by sum(weights)
+            so that KD scale is preserved when weights are sparse. Default False
+            keeps the original behavior (sparse weights → small KD).
 
     Returns:
         Scalar loss. Normalization: mean over (B, T).
@@ -34,7 +38,12 @@ def sequence_kl_loss(student_logits: torch.Tensor,
     if weights is None:
         per_token_kl = (t_soft * (t_logsm - s_logsm)).sum(dim=-1)
     else:
-        per_token_kl = (weights * t_soft * (t_logsm - s_logsm)).sum(dim=-1)
+        weighted_kl = (weights * t_soft * (t_logsm - s_logsm)).sum(dim=-1)
+        if normalize_by_weight_mass:
+            mass = (weights * t_soft).sum(dim=-1).clamp(min=1e-8)
+            per_token_kl = weighted_kl / mass
+        else:
+            per_token_kl = weighted_kl
 
     return per_token_kl.mean() * (T * T)
 
