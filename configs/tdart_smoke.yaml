@@ -1,0 +1,25 @@
+# T-DART smoke test
+method_name: "T-DART"
+base_model: "Qwen/Qwen2.5-0.5B"
+teacher_checkpoint_path: "teachers/delta_teacher_v1"
+reference_model_name: "Qwen/Qwen2.5-0.5B"
+student_init: "reference_model"
+topk: 20
+max_probe_tokens_per_prompt: 32
+K_student: 20
+K_reference: 20
+num_steps: 2
+batch_size: 1
+seq_len: 16
+finetune_steps: 10
+finetune_lr: 0.00005
+eval_every: 2
+eval_batches: 1
+seeds: [0]
+perturb_std: 0.0
+lambda_ce: 0.3
+lambda_rank: 0.5
+lambda_delta: 0.2
+lambda_cons: 0.0
+min_margin: 0.1
+allow_synthetic: true
