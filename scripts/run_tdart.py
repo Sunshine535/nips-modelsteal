@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""T-DART: Teacher-Delta Adaptive Ranking Transfer.
+"""C-DART: Censored Teacher-Delta Ranking Transfer.
 
 Steal teacher-specific behavior by learning relative residual logits
-over adaptively queried candidate tokens, anchored to a public reference model.
+over observed candidate tokens, anchored to a public reference model,
+with censored constraints from top-K absence.
 
 Variants:
-  ce_only              — CE on public data only (no teacher signal)
-  strict_topk_kd       — top-K sparse KL (Q-UMC baseline)
-  bild_topk_delta      — top-K logit difference loss (BiLD-style baseline)
-  tdart_no_adaptive    — residual ranking, fixed candidates (no adaptive probes)
-  tdart_full           — full T-DART: residual ranking + adaptive candidates
-  full_logit_upper     — oracle full-logit KD (upper bound, not strict)
+  ce_only                  — CE on public data only (no teacher signal)
+  strict_topk_kd           — top-K sparse KL (Q-UMC baseline)
+  bild_topk_delta          — top-K logit difference loss (BiLD-style baseline)
+  tdart_no_adaptive        — residual ranking, teacher top-K only (T-DART v1 best)
+  tdart_full               — T-DART with adaptive probes (v1 negative)
+  cdart_no_censor          — residual ranking without censored constraints (ablation)
+  cdart_full               — MAIN: residual ranking + censored top-K absence constraints
+  full_logit_upper         — oracle full-logit KD (upper bound, not strict)
 """
 from __future__ import annotations
 import argparse, json, logging, math, os, sys, time
@@ -30,6 +33,7 @@ from src.oracles import StrictBlackBoxAPI
 from src.residual_delta import compute_residual, build_pairwise_preferences, compute_student_residual
 from src.adaptive_candidates import select_candidates_batch
 from src.ranking_losses import pairwise_residual_rank_loss, residual_mse_loss
+from src.censored_delta import build_censored_candidates, censored_residual_rank_loss
 from src.kd_losses import sequence_kl_loss, sequence_ce_loss
 from src.result_manifest import save_manifest
 
@@ -58,6 +62,7 @@ def parse_args():
     p.add_argument("--lambda_rank", type=float, default=0.5)
     p.add_argument("--lambda_delta", type=float, default=0.2)
     p.add_argument("--min_margin", type=float, default=0.1)
+    p.add_argument("--lambda_censor", type=float, default=0.2)
     p.add_argument("--eval_every", type=int, default=500)
     p.add_argument("--eval_batches", type=int, default=50)
     p.add_argument("--output_dir", default="results/tdart_gate_v1")
@@ -135,7 +140,10 @@ def train_variant(name, teacher_api, teacher_model, reference_model,
     is_topk_kd = (name == "strict_topk_kd")
     is_bild = (name == "bild_topk_delta")
     is_tdart = name.startswith("tdart")
+    is_cdart = name.startswith("cdart")
     use_adaptive = (name == "tdart_full")
+    use_residual = is_tdart or is_cdart or is_bild
+    use_censored = (name == "cdart_full")
 
     optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_steps)
@@ -145,7 +153,9 @@ def train_variant(name, teacher_api, teacher_model, reference_model,
     step = 0
     history = []
     mech = {"variant": name, "rank_loss": [], "delta_mse": [], "ce_loss": [],
-            "candidate_size": [], "probe_queries": 0}
+            "censor_loss": [], "censored_pairs": [],
+            "candidate_size": [], "probe_queries": 0,
+            "censored_constraints_active": use_censored}
     train_iter = iter(train_loader)
     pbar = tqdm(total=args.num_steps, desc=name)
 
@@ -197,6 +207,8 @@ def train_variant(name, teacher_api, teacher_model, reference_model,
 
             total_rank_loss = torch.tensor(0.0, device=device)
             total_delta_loss = torch.tensor(0.0, device=device)
+            total_censor_loss = torch.tensor(0.0, device=device)
+            total_censor_pairs = 0
             n_pos = 0
 
             for pos in range(-8, 0):
@@ -232,7 +244,7 @@ def train_variant(name, teacher_api, teacher_model, reference_model,
                                 else:
                                     pb_match = (probe_t == cid).nonzero(as_tuple=True)
                                     if len(pb_match[0]) > 0:
-                                        t_at_cand[j] = probed[0, -1, pb_match[0][0]]
+                                        t_at_cand[j] = probed[0, pos, pb_match[0][0]]
                         else:
                             t_at_cand = t_topk_vals_pos[b]
                             cand_ids = t_topk_ids_pos[b]
@@ -256,15 +268,38 @@ def train_variant(name, teacher_api, teacher_model, reference_model,
                         total_rank_loss = total_rank_loss + pairwise_residual_rank_loss(
                             delta_s, delta_t, mask=pair_mask)
                         total_delta_loss = total_delta_loss + residual_mse_loss(delta_s, delta_t)
+
+                    if use_censored:
+                        s_topk_b = s_logits_pos[b].detach().topk(args.K_student).indices
+                        r_topk_b = ref_logits_pos[b].topk(args.K_reference).indices
+                        obs_ids, cen_ids, tau_T, dt_ub = build_censored_candidates(
+                            t_topk_ids_pos[b], t_topk_vals_pos[b],
+                            s_topk_b, r_topk_b, ref_logits_pos[b])
+                        if len(cen_ids) > 0:
+                            delta_s_obs = compute_student_residual(
+                                s_logits_pos[b:b+1], ref_logits_pos[b:b+1], obs_ids).squeeze(0)
+                            delta_t_obs = compute_residual(
+                                t_topk_vals_pos[b].unsqueeze(0),
+                                ref_logits_pos[b:b+1], obs_ids).squeeze(0)
+                            delta_s_cen = compute_student_residual(
+                                s_logits_pos[b:b+1], ref_logits_pos[b:b+1], cen_ids).squeeze(0)
+                            total_censor_loss = total_censor_loss + censored_residual_rank_loss(
+                                delta_s_obs, delta_t_obs, delta_s_cen, dt_ub,
+                                margin=args.min_margin)
+                            total_censor_pairs += len(cen_ids)
                     n_pos += 1
 
             if n_pos > 0:
                 total_rank_loss = total_rank_loss / n_pos
                 total_delta_loss = total_delta_loss / n_pos
+                if use_censored:
+                    total_censor_loss = total_censor_loss / n_pos
 
             loss = (args.lambda_ce * loss_ce +
                     args.lambda_rank * total_rank_loss +
                     args.lambda_delta * total_delta_loss)
+            if use_censored:
+                loss = loss + args.lambda_censor * total_censor_loss
             loss_rank_val = total_rank_loss.item()
             loss_delta_val = total_delta_loss.item()
 
@@ -281,6 +316,9 @@ def train_variant(name, teacher_api, teacher_model, reference_model,
                             rank=f"{loss_rank_val:.4f}",
                             ce=f"{loss_ce.item():.4f}")
             mech["rank_loss"].append(loss_rank_val)
+            if use_censored:
+                mech["censor_loss"].append(total_censor_loss.item() if isinstance(total_censor_loss, torch.Tensor) else 0.0)
+                mech["censored_pairs"].append(total_censor_pairs)
             mech["delta_mse"].append(loss_delta_val)
             mech["ce_loss"].append(loss_ce.item())
             if is_tdart:
@@ -317,7 +355,7 @@ def main():
             if hasattr(args, k):
                 setattr(args, k, v)
         for attr in ("lr", "kd_temp", "lambda_ce", "lambda_rank", "lambda_delta",
-                      "min_margin", "perturb_std", "finetune_lr"):
+                      "lambda_censor", "min_margin", "perturb_std", "finetune_lr"):
             if hasattr(args, attr):
                 setattr(args, attr, float(getattr(args, attr)))
 

@@ -19,4 +19,4 @@ Forbidden pivots:
 - paper claim before gates pass.
 
 Scope Compliance Status:
-PASS for T-DART if implemented as black-box teacher-specific residual extraction under strict API.
+PASS for C-DART if implemented as strict black-box teacher-specific residual extraction using censored top-K constraints.

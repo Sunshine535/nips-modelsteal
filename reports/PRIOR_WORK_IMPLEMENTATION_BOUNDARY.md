@@ -1,7 +1,8 @@
 # Prior Work Implementation Boundary
 
-## Main Method (T-DART)
-- All code in `src/residual_delta.py`, `src/adaptive_candidates.py`, `src/ranking_losses.py` must be ORIGINAL implementation
+## Main Method (C-DART, strengthened from T-DART)
+- All code in `src/residual_delta.py`, `src/censored_delta.py`, `src/ranking_losses.py` must be ORIGINAL implementation
+- `src/adaptive_candidates.py` kept for ablation only (adaptive probing not current main mechanism)
 - No external code may be copied into these files
 - Implementation informed by paper descriptions but written from scratch
 

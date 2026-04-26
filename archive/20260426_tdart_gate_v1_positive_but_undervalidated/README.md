@@ -1,0 +1,1 @@
+T-DART gate v1 produced a positive residual/delta signal versus CE-only, but the adaptive full method underperformed and novelty over BiLD-style delta remains unresolved. These results are preserved as positive-but-undervalidated evidence, not final paper evidence.
