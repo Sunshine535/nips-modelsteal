@@ -1,0 +1,32 @@
+# C-DART Phase 1: Qwen3-0.6B multi-model validation
+method_name: "C-DART"
+base_model: "Qwen/Qwen3-0.6B"
+teacher_checkpoint_path: "teachers/qwen3_0.6b_v1"
+reference_model_name: "Qwen/Qwen3-0.6B"
+student_init: "reference_model"
+topk: 20
+max_probe_tokens_per_prompt: 0
+K_student: 20
+K_reference: 20
+num_steps: 5000
+batch_size: 8
+seq_len: 128
+lr: 0.00002
+finetune_steps: 500
+finetune_lr: 0.00005
+eval_every: 500
+eval_batches: 50
+perturb_std: 0.0
+lambda_ce: 0.3
+lambda_rank: 0.3
+lambda_delta: 0.2
+lambda_censor: 0.2
+min_margin: 0.1
+variants:
+  - ce_only
+  - strict_topk_kd
+  - bild_topk_delta
+  - tdart_no_adaptive
+  - cdart_no_censor
+  - cdart_full
+  - full_logit_upper
