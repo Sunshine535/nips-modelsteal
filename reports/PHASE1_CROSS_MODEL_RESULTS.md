@@ -1,7 +1,7 @@
 # Phase 1: C-DART Cross-Model Validation — COMPLETE
 
-**Date**: 2026-04-27
-**Models**: Qwen2.5-0.5B, Llama-3.2-1B, Llama-3.2-3B
+**Date**: 2026-04-27 → 2026-04-28 (Qwen3 added)
+**Models**: Qwen2.5-0.5B, Qwen3-0.6B, Llama-3.2-1B, Llama-3.2-3B
 **Setup**: Delta teacher (500-step FT on WikiText TEST), top-K=20, 5000 steps, 3 seeds
 
 ---
@@ -11,12 +11,27 @@
 | Model | ce_only KL | cdart_full KL | vs ce_only | vs BiLD | Censoring Δ | Gap Closure |
 |-------|-----------|--------------|------------|---------|-------------|-------------|
 | **Qwen2.5-0.5B** | 0.608±0.002 | **0.209±0.003** | **+65.6%** | +5.9% | +4.2% | **66.3%** |
+| **Qwen3-0.6B** | 0.303±0.000 | **0.120±0.001** | **+60.4%** | +9.8% | +4.3% | **64.5%** |
 | **Llama-3.2-1B** | 0.647±0.003 | **0.296±0.009** | **+54.2%** | +11.4% | +8.2% | **58.3%** |
 | **Llama-3.2-3B** | 0.564±0.002 | **0.336±0.008** | **+40.3%** | +8.7% | +8.8% | **53.5%** |
 
 ---
 
 ## Detailed Results by Model
+
+### Qwen3-0.6B (28L, d=1024, 16H/8KV, vocab=151936)
+
+Teacher-Reference gap: KL=1.024
+
+| Variant | KL↓ (m±s) | Top-1↑ (m±s) | PPL | vs ce_only |
+|---------|-----------|-------------|-----|------------|
+| ce_only | 0.303 ± 0.000 | 0.736 ± 0.001 | 18.7 | baseline |
+| strict_topk_kd | 1.418 ± 0.000 | 0.822 ± 0.000 | 99.5 | -368% |
+| bild_topk_delta | 0.133 ± 0.000 | 0.815 ± 0.000 | 20.4 | +56.1% |
+| tdart_no_adaptive | 0.125 ± 0.000 | 0.822 ± 0.001 | 20.7 | +58.6% |
+| cdart_no_censor | 0.125 ± 0.000 | 0.822 ± 0.001 | 20.7 | +58.6% |
+| **cdart_full** | **0.120 ± 0.001** | **0.826 ± 0.001** | 20.8 | **+60.4%** |
+| full_logit_upper | 0.019 ± 0.000 | 0.920 ± 0.000 | 23.6 | oracle |
 
 ### Qwen2.5-0.5B (24L, d=896, 14H/2KV, vocab=151936)
 
@@ -64,31 +79,35 @@ Teacher-Reference gap: KL=0.935
 
 ## Cross-Model Gate Analysis
 
-### Gate 1: C-DART beats ce_only? ✅ ALL MODELS
+### Gate 1: C-DART beats ce_only? ✅ ALL 4 MODELS
 - Qwen2.5-0.5B: +65.6% (3/3 seeds)
+- Qwen3-0.6B: +60.4% (3/3 seeds)
 - Llama-3.2-1B: +54.2% (3/3 seeds)
 - Llama-3.2-3B: +40.3% (3/3 seeds)
 
-### Gate 2: C-DART beats BiLD? ✅ ALL MODELS
+### Gate 2: C-DART beats BiLD? ✅ ALL 4 MODELS
 - Qwen2.5-0.5B: +5.9% (3/3 seeds)
+- Qwen3-0.6B: +9.8% (3/3 seeds)
 - Llama-3.2-1B: +11.4% (3/3 seeds)
 - Llama-3.2-3B: +8.7% (3/3 seeds)
 
-### Gate 3: Censoring adds value? ✅ ALL MODELS
+### Gate 3: Censoring adds value? ✅ ALL 4 MODELS
 - Qwen2.5-0.5B: +4.2% (3/3 seeds)
+- Qwen3-0.6B: +4.3% (3/3 seeds)
 - Llama-3.2-1B: +8.2% (3/3 seeds)
 - Llama-3.2-3B: +8.8% (3/3 seeds)
 
-### Gate 4: Stability? ✅ ALL MODELS
+### Gate 4: Stability? ✅ ALL 4 MODELS
 - All std < 0.009 KL across 3 seeds
+- Qwen3-0.6B: exceptionally stable (std ≤ 0.001)
 
 ---
 
 ## Key Findings
 
-### 1. C-DART generalizes across architectures ✅
-Tested on 2 distinct model families (Qwen with 2 KV heads vs Llama with 8 KV heads),
-3 model sizes (0.5B, 1.3B, 3.2B). All gates pass consistently.
+### 1. C-DART generalizes across architectures and model generations ✅
+Tested on 2 distinct model families (Qwen with 2-8 KV heads vs Llama with 8 KV heads),
+2 Qwen generations (2.5 and 3), 4 model sizes (0.5B, 0.6B, 1.3B, 3.2B). All gates pass consistently.
 
 ### 2. Censoring is the novel contribution
 The ablation decomposition is clean:
@@ -103,30 +122,24 @@ suggesting it becomes more valuable with more diverse architectures.
 strict_topk_kd is -101% to -145% worse than ce_only on all models.
 This is a strong, surprising negative result.
 
-### 4. Gap closure decreases with model size
-- 0.5B: 66.3%
-- 1.3B: 58.3%
-- 3.2B: 53.5%
+### 4. Gap closure consistent at 53-66%
+- Qwen2.5-0.5B: 66.3%
+- Qwen3-0.6B: 64.5%
+- Llama-3.2-1B: 58.3%
+- Llama-3.2-3B: 53.5%
 
-Expected: larger models have more complex internal representations.
-The trend is smooth and can be analyzed in the paper.
+Decreases slightly with model size; Qwen models show higher closure than Llama.
 
 ### 5. Teacher-reference gap varies by model
 - Qwen2.5-0.5B: KL=0.495 (small gap)
+- Qwen3-0.6B: KL=1.024 (larger gap)
 - Llama-3.2-1B: KL=0.991 (larger gap)
 - Llama-3.2-3B: KL=0.935 (similar to 1B)
 
-C-DART works across different gap magnitudes.
+C-DART works across different gap magnitudes (0.5-1.0 KL).
 
 ---
 
 ## Decision
 
-**CONTINUE TO PHASE 2.** All Phase 1 gates pass on all 3 models.
-
-Phase 2 priorities:
-1. Top-K sensitivity sweep (K=5, 10, 20, 50)
-2. Gap scaling (500, 2000, 5000 step teachers)
-3. Baseline comparison (DKD, DIST)
-4. Downstream task evaluation (MMLU, HellaSwag)
-5. Qwen3 model (if download resolved)
+**ALL 4 MODELS PASS. PROCEED TO AUTO-REVIEW-LOOP.**
