@@ -179,10 +179,8 @@ def train_variant(name, teacher_api, teacher_model, reference_model,
             loss_delta_val = 0.0
         elif is_full_logit:
             t_logits = teacher_api.get_full_logits_ORACLE_ONLY(ids)
-            T_kd = args.kd_temp
-            loss_kd = F.kl_div(F.log_softmax(s_logits/T_kd, dim=-1),
-                               F.softmax(t_logits.float()/T_kd, dim=-1),
-                               reduction="batchmean") * (T_kd*T_kd)
+            loss_kd = sequence_kl_loss(s_logits, t_logits.float(),
+                                       temperature=args.kd_temp)
             loss = 0.7 * loss_kd + 0.3 * loss_ce
             loss_rank_val = 0.0
             loss_delta_val = loss_kd.item()
@@ -191,10 +189,8 @@ def train_variant(name, teacher_api, teacher_model, reference_model,
             V = logit_shape[-1]
             t_logits = torch.full((B, T_seq, V), -1e9, device=device)
             t_logits.scatter_(-1, topk_idx, topk_vals)
-            T_kd = args.kd_temp
-            loss_kd = F.kl_div(F.log_softmax(s_logits/T_kd, dim=-1),
-                               F.softmax(t_logits.float()/T_kd, dim=-1),
-                               reduction="batchmean") * (T_kd*T_kd)
+            loss_kd = sequence_kl_loss(s_logits, t_logits.float(),
+                                       temperature=args.kd_temp)
             loss = 0.7 * loss_kd + 0.3 * loss_ce
             loss_rank_val = 0.0
             loss_delta_val = loss_kd.item()
