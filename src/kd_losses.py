@@ -48,6 +48,55 @@ def sequence_kl_loss(student_logits: torch.Tensor,
     return per_token_kl.mean() * (T * T)
 
 
+def dkd_loss(student_logits: torch.Tensor,
+             teacher_logits: torch.Tensor,
+             labels: torch.Tensor,
+             temperature: float = 4.0,
+             alpha: float = 1.0,
+             beta: float = 8.0) -> torch.Tensor:
+    """Decoupled Knowledge Distillation (Zhao et al., CVPR 2022).
+
+    Separates KL into target-class (TCKD) and non-target-class (NCKD) terms,
+    weighting NCKD more heavily to transfer dark knowledge.
+
+    Args:
+        student_logits: (B, T, V)
+        teacher_logits: (B, T, V)
+        labels: (B, T) ground-truth token ids
+        temperature: softmax temperature
+        alpha: weight for TCKD (target class)
+        beta: weight for NCKD (non-target classes)
+    Returns:
+        Scalar loss, averaged over (B, T).
+    """
+    B, T_seq, V = student_logits.shape
+    s_flat = student_logits.reshape(-1, V) / temperature
+    t_flat = teacher_logits.reshape(-1, V) / temperature
+    lab_flat = labels.reshape(-1)
+
+    s_prob = F.softmax(s_flat, dim=-1)
+    t_prob = F.softmax(t_flat, dim=-1)
+
+    gt_mask = torch.zeros_like(s_prob).scatter_(1, lab_flat.unsqueeze(1), 1).bool()
+
+    s_tgt = s_prob[gt_mask].unsqueeze(1)
+    t_tgt = t_prob[gt_mask].unsqueeze(1)
+    s_nontgt = s_prob[~gt_mask].view(-1, V - 1)
+    t_nontgt = t_prob[~gt_mask].view(-1, V - 1)
+
+    s_tgt_pair = torch.cat([s_tgt, 1 - s_tgt], dim=1)
+    t_tgt_pair = torch.cat([t_tgt, 1 - t_tgt], dim=1)
+    tckd = F.kl_div(s_tgt_pair.log().clamp(min=-100), t_tgt_pair,
+                    reduction='batchmean') * (temperature ** 2)
+
+    s_nontgt_norm = s_nontgt / s_nontgt.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    t_nontgt_norm = t_nontgt / t_nontgt.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    nckd = F.kl_div(s_nontgt_norm.log().clamp(min=-100), t_nontgt_norm,
+                    reduction='batchmean') * (temperature ** 2)
+
+    return alpha * tckd + beta * nckd
+
+
 def sequence_ce_loss(student_logits: torch.Tensor,
                      labels: torch.Tensor) -> torch.Tensor:
     """CE on next-token prediction.

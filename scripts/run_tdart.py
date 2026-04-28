@@ -34,7 +34,7 @@ from src.residual_delta import compute_residual, build_pairwise_preferences, com
 from src.adaptive_candidates import select_candidates_batch
 from src.ranking_losses import pairwise_residual_rank_loss, residual_mse_loss
 from src.censored_delta import build_censored_candidates, censored_residual_rank_loss
-from src.kd_losses import sequence_kl_loss, sequence_ce_loss
+from src.kd_losses import sequence_kl_loss, sequence_ce_loss, dkd_loss
 from src.result_manifest import save_manifest
 
 logger = logging.getLogger(__name__)
@@ -129,6 +129,55 @@ def evaluate(teacher, student, eval_loader, device, max_batches=50):
     return {"kl": sum(kls)/len(kls), "top1": sum(top1s)/len(top1s),
             "ppl": ppl, "ce": sum(losses)/len(losses)}
 
+
+@torch.no_grad()
+def evaluate_downstream_ppl(student, eval_loader, device, max_batches=50):
+    """Evaluate student PPL on a downstream dataset (no teacher needed)."""
+    losses = []
+    for i, batch in enumerate(eval_loader):
+        if i >= max_batches: break
+        ids = batch.to(device)
+        s_logits = student(input_ids=ids).logits[:, :-1, :].float()
+        labels = ids[:, 1:]
+        ce = F.cross_entropy(s_logits.reshape(-1, s_logits.size(-1)), labels.reshape(-1))
+        losses.append(ce.item())
+    if not losses:
+        return {"ppl": float("inf"), "ce": float("inf")}
+    avg_ce = sum(losses) / len(losses)
+    return {"ppl": math.exp(avg_ce), "ce": avg_ce}
+
+
+class C4Split(Dataset):
+    """C4 validation split for downstream eval."""
+    def __init__(self, tokenizer, seq_len, max_samples=2000):
+        self.samples = []
+        self.source = "none"
+        try:
+            from datasets import load_dataset
+            ds = load_dataset("allenai/c4", "en", split="validation",
+                              streaming=True, trust_remote_code=True)
+            self.source = "c4/validation"
+            buf = []
+            count = 0
+            for ex in ds:
+                t = ex.get("text", "").strip()
+                if len(t) < 20:
+                    continue
+                ids = tokenizer(t, add_special_tokens=False)["input_ids"]
+                buf.extend(ids)
+                while len(buf) >= seq_len:
+                    self.samples.append(torch.tensor(buf[:seq_len], dtype=torch.long))
+                    buf = buf[seq_len:]
+                    count += 1
+                    if count >= max_samples:
+                        break
+                if count >= max_samples:
+                    break
+        except Exception as e:
+            logger.warning("C4 load failed: %s — downstream eval skipped", e)
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, i): return self.samples[i]
+
 def train_variant(name, teacher_api, teacher_model, reference_model,
                   student, train_loader, eval_loader, args, device):
     logger.info("\n" + "="*60)
@@ -137,6 +186,7 @@ def train_variant(name, teacher_api, teacher_model, reference_model,
 
     is_ce_only = (name == "ce_only")
     is_full_logit = (name == "full_logit_upper")
+    is_dkd = (name == "dkd_full")
     is_topk_kd = (name == "strict_topk_kd")
     is_bild = (name == "bild_topk_delta")
     is_tdart = name.startswith("tdart")
@@ -177,6 +227,13 @@ def train_variant(name, teacher_api, teacher_model, reference_model,
             loss = loss_ce
             loss_rank_val = 0.0
             loss_delta_val = 0.0
+        elif is_dkd:
+            t_logits = teacher_api.get_full_logits_ORACLE_ONLY(ids)
+            loss_dkd = dkd_loss(s_logits[:, :-1, :], t_logits.float()[:, :-1, :],
+                                ids[:, 1:], temperature=args.kd_temp)
+            loss = 0.7 * loss_dkd + 0.3 * loss_ce
+            loss_rank_val = 0.0
+            loss_delta_val = loss_dkd.item()
         elif is_full_logit:
             t_logits = teacher_api.get_full_logits_ORACLE_ONLY(ids)
             loss_kd = sequence_kl_loss(s_logits, t_logits.float(),
@@ -430,7 +487,11 @@ def main():
                                   shuffle=True, num_workers=0, drop_last=True)
         eval_loader = DataLoader(eval_ds, batch_size=args.batch_size,
                                  shuffle=False, num_workers=0)
-        logger.info("Train: %d, Eval: %d", len(train_ds), len(eval_ds))
+
+        c4_ds = C4Split(tokenizer, args.seq_len, max_samples=2000)
+        c4_loader = DataLoader(c4_ds, batch_size=args.batch_size,
+                               shuffle=False, num_workers=0) if len(c4_ds) > 0 else None
+        logger.info("Train: %d, Eval: %d, C4: %d", len(train_ds), len(eval_ds), len(c4_ds))
 
         teacher_metrics = evaluate(teacher, reference, eval_loader, args.device, args.eval_batches)
         logger.info("Teacher-vs-Reference gap: KL=%.4f top1=%.4f",
@@ -454,6 +515,12 @@ def main():
 
             res = train_variant(variant_name, api, teacher, reference,
                                 student, train_loader, eval_loader, args, args.device)
+            if c4_loader is not None:
+                student.eval()
+                c4_metrics = evaluate_downstream_ppl(student, c4_loader, args.device, args.eval_batches)
+                res["c4_ppl"] = c4_metrics["ppl"]
+                res["c4_ce"] = c4_metrics["ce"]
+                logger.info("[%s] C4 PPL=%.2f", variant_name, c4_metrics["ppl"])
             all_results["variants"][variant_name] = res
             del student
             torch.cuda.empty_cache()
